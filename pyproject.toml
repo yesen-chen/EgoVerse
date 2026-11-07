@@ -1,0 +1,110 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "egomimic"
+version = "1.0"
+description = "Egomimic Scripts Package"
+requires-python = ">=3.11"
+dependencies = [
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "projectaria-tools[all]==2.0.0",
+    "pyyaml",
+    "matplotlib",
+    "packaging",
+    "h5py",
+    "ipython",
+    "rich",
+    "wandb",
+    "hydra-core",
+    "hydra-submitit-launcher==1.2.0",
+    "black",
+    "gpustat",
+    "pynvml",
+    "termcolor",
+    "pyquaternion",
+    "rospkg",
+    "einops",
+    "av==12.0.0",
+    "opencv-python",
+    "dm-control==1.0.8",
+    "mink==0.0.13",
+    "mujoco==3.4.0",
+    "submitit",
+    "arm_pytorch_utilities",
+    "pytorch-kinematics",
+    "lightning",
+    "positional-encodings[pytorch]",
+    "argparse",
+    "pandas",
+    "overrides",
+    "zarr==3.1.5",
+    "tabulate",
+    "transformers==4.53.2",
+    "timm",
+    "boto3",
+    "cloudpathlib",
+    "sqlalchemy",
+    "psycopg[binary]",
+    "ray",
+    "geomloss",
+    "tslearn",
+    "typing_extensions",
+    "pyarrow",
+    "simplejpeg",
+    "prettytable",
+    "datasets==4.0.0",
+    "s5cmd",
+    "mediapy",
+    "pytest",
+    "pre-commit",
+    "ruff==0.8.6",  # keep in sync with .pre-commit-config.yaml and ci.yml
+    "scaleapi",
+    "openai",
+    "scikit-learn>=1.8.0",
+    "scipy",
+]
+
+# Not declared: `openpi` (egomimic/algo/pi.py). The fork at external/openpi pins
+# lerobot -> av>=14.2, which conflicts with av==12.0.0 above, so it cannot be a
+# resolvable extra. Install it without its dependencies, as the lab venv does:
+#     uv pip install --no-deps -e external/openpi
+# then apply openpi's `transformers_replace` patch (README, "Installation").
+# `uv sync` reinstalls transformers and silently undoes that patch.
+#
+# Also not declared: `scale_sensor_fusion_io` (PyPI: scale-sensor-fusion-io),
+# imported only by the Scale converter under external/scale/scripts, which is
+# not part of this package; install it by hand when running that converter.
+# The Ray data-processing image keeps its own requirements-ray.txt.
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["egomimic*"]
+
+[tool.setuptools.package-data]
+egomimic = ["hydra_configs/**/*.yaml", "resources/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    "external",
+    "emimic",
+    "logs",
+    "scratch",
+    "stanford_repo",  # pytest matches norecursedirs against basenames
+    ".*",
+    "*.egg-info",
+]
+markers = [
+    "integration: needs cluster data, credentials, a GPU, or optional extras; skipped unless --integration is passed",
+    "gpu: needs a CUDA device; run with --integration -m gpu on a GPU node",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = "emimic"
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+exclude = ["emimic", "external", "logs", "scratch", "assets", "**/__pycache__", "**/*.egg-info"]

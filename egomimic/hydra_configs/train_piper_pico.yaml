@@ -1,0 +1,15 @@
+# HPT + shared Flow Matching; offline local recordings and source-group splits.
+defaults:
+  - train_zarr_cartesian
+  - override model: hpt_piper_pico_sharedFM
+  - override data: piper_pico_local
+  - override trainer: default
+  - override logger: null
+  - override evaluator: eval_piper_pico
+  - override hydra/launcher: basic
+  - _self_
+
+name: piper_pico
+description: shared_fm
+# Data selection supplies exactly the active domains; old recipes can still compose.
+action_timing: ${oc.select:recordings.selected_timing,null}

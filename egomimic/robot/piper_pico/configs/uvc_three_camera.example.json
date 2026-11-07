@@ -1,0 +1,54 @@
+{
+  "schema": "camera_rig_v1",
+  "description": "EXAMPLE ONLY: replace device placeholders and verify every native mode and focus setting. No hardware mode or latency is asserted here. Add calibration_file to front_1 pointing to its matching raw calibration.json before calibrated recording; relative paths resolve beside this config. Latency 0 is an unmeasured diagnostic placeholder, not a measurement. No extrinsics are provided. Requested controls for all three cameras are manual 20 ms exposure and brightness 48; verify support on the selected hardware.",
+  "cameras": [
+    {
+      "name": "front_1",
+      "type": "uvc",
+      "device": "/dev/v4l/by-id/REPLACE_FRONT_VIDEO_INDEX0",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "fourcc": "MJPG",
+      "latency": 0,
+      "latency_status": "unmeasured",
+      "controls": {
+        "brightness": 48,
+        "auto_exposure": 1,
+        "exposure_time_absolute": 200
+      }
+    },
+    {
+      "name": "left_wrist",
+      "type": "uvc",
+      "device": "/dev/v4l/by-id/REPLACE_LEFT_WRIST_VIDEO_INDEX0",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "fourcc": "MJPG",
+      "latency": 0,
+      "latency_status": "unmeasured",
+      "controls": {
+        "brightness": 48,
+        "auto_exposure": 1,
+        "exposure_time_absolute": 200
+      }
+    },
+    {
+      "name": "right_wrist",
+      "type": "uvc",
+      "device": "/dev/v4l/by-id/REPLACE_RIGHT_WRIST_VIDEO_INDEX0",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "fourcc": "MJPG",
+      "latency": 0,
+      "latency_status": "unmeasured",
+      "controls": {
+        "brightness": 48,
+        "auto_exposure": 1,
+        "exposure_time_absolute": 200
+      }
+    }
+  ]
+}

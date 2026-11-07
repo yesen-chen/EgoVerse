@@ -1,0 +1,48 @@
+# @package _global_
+defaults:
+  - /recordings@_global_.recordings: piper_pico
+  - _self_
+
+recordings:
+  domains: [piper_bimanual]
+  selected_timing:
+    piper_bimanual: ${recordings.piper_timing}
+
+data:
+  _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+  train_datasets:
+    piper_bimanual:
+      _target_: egomimic.rldb.zarr.local_recordings.RecordingMultiDataset._from_resolver
+      resolver:
+        _target_: egomimic.rldb.zarr.local_recordings.LocalRecordingResolver
+        folder_path: ${recordings.piper_root}
+        kind: piper
+        allow_synthetic_calibration: ${recordings.allow_synthetic_calibration}
+        key_map:
+          _target_: egomimic.rldb.embodiment.piper.Piper.get_keymap
+          keymap_mode: cartesian
+          timing: ${recordings.piper_timing}
+        transform_list:
+          _target_: egomimic.rldb.embodiment.piper.Piper.get_transform_list
+          mode: cartesian
+          timing: ${recordings.piper_timing}
+      mode: train
+      sample_policy: ${recordings.sample_policy}
+      valid_ratio: ${recordings.valid_ratio}
+      split_seed: ${recordings.split_seed}
+  valid_datasets:
+    piper_bimanual:
+      _target_: egomimic.rldb.zarr.local_recordings.RecordingMultiDataset._from_resolver
+      resolver: ${data.train_datasets.piper_bimanual.resolver}
+      mode: valid
+      sample_policy: ${recordings.sample_policy}
+      valid_ratio: ${recordings.valid_ratio}
+      split_seed: ${recordings.split_seed}
+  train_dataloader_params:
+    piper_bimanual:
+      batch_size: ${recordings.batch_size}
+      num_workers: ${recordings.num_workers}
+  valid_dataloader_params:
+    piper_bimanual:
+      batch_size: ${recordings.batch_size}
+      num_workers: ${recordings.num_workers}

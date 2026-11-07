@@ -1,0 +1,19 @@
+# Default data for train_zarr_cartesian_pi: every eva_bimanual episode, with
+# language annotations (inherited from cotrain_pi_base). Not a camera-naming
+# twin of data=eva -- that one is a single pinned episode with no annotations.
+defaults:
+  - cotrain_pi_base
+  - _self_
+
+train_datasets:
+  eva_bimanual:
+    filters:
+      _target_: egomimic.rldb.filters.DatasetFilter
+      filter_lambdas:
+        - "lambda row: row.get('embodiment') == 'eva_bimanual'"
+    mode: total
+  human_bimanual: null
+
+valid_datasets:
+  eva_bimanual: ${data.train_datasets.eva_bimanual}
+  human_bimanual: null

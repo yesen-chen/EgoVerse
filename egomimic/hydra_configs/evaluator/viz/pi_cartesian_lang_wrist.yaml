@@ -1,0 +1,10 @@
+defaults:
+  - cartesian_wrist
+  - _self_
+
+eva_bimanual:
+  image_key: observations.images.front_img_1
+  annotation_key: sampled_prompt
+human_bimanual:
+  image_key: observations.images.front_img_1
+  annotation_key: sampled_prompt

@@ -1,0 +1,44 @@
+defaults:
+  - model: hpt_bc_flow_eva
+  - paths: default
+  - trainer: ddp
+  - debug: null
+  - logger: wandb
+  - data: eva
+  - callbacks: checkpoints
+  - evaluator: eval_hpt
+  - override hydra/launcher: submitit
+  - _self_
+
+name: test
+description: test
+ckpt_path: null
+mode: train
+
+hydra:
+  run:
+    # <log_dir>/experiment_name/description_{timestamp}; log_dir defaults to ./logs
+    dir: ${paths.log_dir}/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ${paths.log_dir}/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
+
+launch_params:
+  gpus_per_node: 1
+  nodes: 1
+
+seed: 42
+
+# Opt-in per-embodiment time contracts. No experiment window is selected here.
+# When supplied, checked against all train/valid episodes and saved in checkpoints.
+action_timing: null
+
+# Normalization and norm-stat cache settings (override per-run as needed).
+norm_stats:
+  norm_mode: quantile
+  sample_frac: 1.0
+  num_workers: 4
+  save_cache_dir: ${hydra:runtime.output_dir}
+  precomputed_norm_path: null
+  cache_dir: ${paths.cache_dir}/norm_stats   # content-keyed cache shared across runs
+  use_cache: true                            # false: always recompute, never write
+reject_outliers: true

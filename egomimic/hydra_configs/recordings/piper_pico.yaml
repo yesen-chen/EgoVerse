@@ -1,0 +1,29 @@
+# Local converted recordings. Example time settings, not selected experiment hyperparameters.
+piper_root: ${paths.root_dir}/data/piper_converted
+pico_ego_root: ${paths.root_dir}/data/pico_ego_converted
+gripper_mode: zero
+expected_axis_convention: piper_x
+allow_synthetic_calibration: false
+# Retain finite out-of-distribution validation values; explicit original-policy opt-in.
+sample_policy: finite
+valid_ratio: 0.2
+split_seed: ${seed}
+batch_size: 32
+num_workers: 4
+output_chunk_length: 100
+gripper_dimensions:
+  zero: 12
+  width: 14
+ego_state_dim: ${recordings.gripper_dimensions.${recordings.gripper_mode}}
+piper_timing:
+  source_fps: 30
+  source_horizon: 30
+  action_stride: 1
+  output_chunk_length: ${recordings.output_chunk_length}
+  includes_current: true
+ego_timing:
+  source_fps: 30
+  source_horizon: 30
+  action_stride: 1
+  output_chunk_length: ${recordings.output_chunk_length}
+  includes_current: true

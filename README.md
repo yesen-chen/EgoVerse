@@ -1,0 +1,172 @@
+# EgoVerse: Egocentric Data for Robot Learning from Around the World
+![EgoVerse](./assets/egoverse.png)
+This repository contains the data processing, training and evaluation code for EgoVerse.
+
+本机 PICO + PiPER 的服务启动、相机测试、标定、采集、转换和训练命令见 [操作命令总表](/home/yesen/pico_ego_probe/EgoVerse/README_PIPER_PICO_WORKFLOW.md)。
+当前替换前置相机为 LRCP F1080P；旧 KD 相机已退役。三台 UVC 正式统一为 **640×480、30 fps、MJPG、手动曝光 20 ms、亮度 48**。三相机采集使用 `calibrations/uvc_rig.json`，启动时设置并核对这些控制值；USB 接口为 front `5.3.2`、左腕 `5.3.3`、右腕 `5.3.4`。单 front 测试和标定使用 `calibrations/uvc_front_lrcp_480p_002_camera.json`。该设置已通过 15 秒三路录像检查，均约 30 fps；按当前决定保留历史延迟补偿（front 67.275 ms、两腕 66 ms），未在新曝光下重测。新 front 到双臂 base 的外参标定仍需完成。详细命令见 [UVC 三相机说明](/home/yesen/pico_ego_probe/EgoVerse/egomimic/robot/piper_pico/README_uvc_front.md)。
+
+---
+
+## Change Log
+### Mandatory Camera Intrinsics + Human Embodiment Collapse [07/08/2026]
+- Camera **intrinsics are now MANDATORY** in every episode's `zarr.json`, stored as a `{camera_key: 3×4 K}` dict (single-camera = one entry, e.g. `{"front_1": K}`). `ZarrWriter.create_and_write` raises if it is missing or not a non-empty dict. `extrinsics` (robots) is now strictly `None` or a non-empty dict.
+- **Embodiments collapsed**: all human demonstration data is a single `human_*` embodiment (`human_right_arm`/`human_left_arm`/`human_bimanual`, ids 1–3); the robot Eva is `eva_*` (ids 4–6). Vendor labels (`aria_*`, `mecka_*`, `scale_*`, `lightwheel_*`) are **removed** at the embodiment level — the data source now lives only in the SQL `lab` field. Conversion scripts write `human_*`.
+- **Aria processing — EE/wrist orientation fixed**: aria EE-pose and wrist-pose orientations are now correct and **consistent across both hands** — the left and right hand share the same canonical `T_ROT_CAM` convention, aligned with the robot (Eva) tool frame, so human and robot EE orientations line up for joint training / visualization. Re-process aria data to pick up the corrected orientations.
+- **⚠️ Action required — RE-DOWNLOAD your data.** The embodiment string is stored inside each episode's `zarr.json`, and the reader looks it up with **no alias fallback** (`get_embodiment_id`): a locally cached episode written *before* the collapse still says `aria_bimanual` / `scale_bimanual` / `mecka_bimanual`, and loading it now **hard-crashes with `KeyError: 'ARIA_BIMANUAL'`**. Delete any local cache and re-pull the reprocessed episodes (they carry `human_*` + the mandatory intrinsics). Data *producers*: re-process and re-upload so `zarr.json` includes intrinsics — see [CONTRIBUTING_DATA.md](./CONTRIBUTING_DATA.md). Mecka and Scale will be asked to add intrinsics to their exports.
+
+### Mecka Data Reprocessing [04/01/2026]
+Mecka removed some poorer quality episodes and replaced them with higher quality alternatives.
+
+### Scale Data Reprocessing [05/03/2026]
+The Scale dataset was fully reprocessed on 05/03/2026. All active Scale episodes now use newly generated episode hashes, Zarr paths, and preview MP4 paths. If you previously referenced Scale episode hashes from an older export or intermediate processing run, refresh from the SQL episode table before downloading or training. Old Scale hashes should be treated as stale and should not be mixed with the current active dataset.
+
+---
+
+## Structure
+- [``egomimic/trainHydra.py``](./egomimic/trainHydra.py): Main training script, powered by Pytorch Lightning and Hydra (DDP supported)
+- [``egomimic/hydra_configs``](./egomimic/hydra_configs): Train configs for each algorithm
+- [``egomimic/algo``](./egomimic/algo): Algorithm code: EgoMimic (HPT based), Pi
+- [``egomimic/scripts/aloha_process``](./egomimic/scripts/aloha_process/): Process raw aloha hdf5 to zarr/lerobot
+- [``egomimic/scripts/aria_process``](./egomimic/scripts/aria_process/): Process aria vrs to zarr/lerobot
+
+## Installation
+
+### UV (Recommended)
+
+if uv not installed
+```
+curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/path/to/flash/storage" sh
+```
+
+```
+git clone git@github.com:GaTech-RL2/EgoVerse.git
+cd EgoVerse
+uv venv emimic --python 3.11
+source emimic/bin/activate
+uv pip install -e .
+uv run pre-commit install
+```
+
+`pyproject.toml` (locked in `uv.lock`) is the dependency spec for the
+package. Three things live outside it: `requirements.txt` (used only by the
+Eva robot `Dockerfile`), `requirements-ray.txt` (the Ray data-processing
+image) and `scale_sensor_fusion_io`, needed only by the Scale converter under
+`external/scale/scripts` (`uv pip install scale-sensor-fusion-io`).
+
+For the Pi0.5 policy also install the `openpi` fork from the submodule. It is
+installed without its own dependencies (its `lerobot` pin needs `av>=14.2`,
+which conflicts with our `av==12.0.0`), then its `transformers` patch is copied in:
+```
+git submodule update --init external/openpi
+uv pip install --no-deps -e external/openpi
+cp -r external/openpi/src/openpi/models_pytorch/transformers_replace/* emimic/lib/python3.11/site-packages/transformers/
+```
+Re-run the `cp` after any `uv sync` or `transformers` reinstall, which silently
+undoes the patch. See `pi05.md` for details.
+
+### Conda
+```
+git clone --recursive git@github.com:GaTech-RL2/EgoVerse.git
+cd EgoVerse
+conda create -n emimic python=3.11
+conda activate emimic
+pip install -e .
+pre-commit install
+```
+
+### AWS Configure
+Download the AWS cli
+```
+ curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+ unzip awscliv2.zip
+ ./aws/install -i ~/aws-cli -b ~/bin
+```
+
+Set up your AWS keys to access our cloud storage
+```
+aws configure
+AccessKeyId: <your-access-key-id>
+SecretAccessKey: <your-secret-access-key>
+Default region name: us-east-2
+Default output format:
+./egomimic/utils/aws/setup_secret.sh
+```
+`setup_secret.sh` will allow your current env to download data from cloudflare.
+
+
+### Environment variables
+Every cluster-specific default in the configs can be overridden without editing yaml:
+
+| Variable | Overrides | Default |
+|---|---|---|
+| `EGOVERSE_DATASET_DIR` | `paths.dataset_dir`, the local zarr episode folder | `/coc/flash7/scratch/egoverseS3ZarrDataset` |
+| `EGOVERSE_LOG_DIR` | `paths.log_dir`, root of every run directory | `$EGOVERSE_ROOT/logs` |
+| `EGOVERSE_CACHE_DIR` | `paths.cache_dir`; norm stats cached by content under `<cache_dir>/norm_stats/` | `$EGOVERSE_LOG_DIR/cache` |
+| `EGOVERSE_ROOT` | `paths.root_dir` | the directory you launch from |
+| `EGOVERSE_PI05_WEIGHTS` | pi0.5 base weights directory (`model.robomimic_model.config.pytorch_weight_path`) | lab PACE path |
+| `WANDB_ENTITY`, `WANDB_PROJECT` | `logger.wandb.entity` / `.project` | `rl2-group` / `zarr_test` |
+
+### Other Settings
+Set `git config --global submodule.recurse true` if you want `git pull` to automatically update the submodule as well.
+Set your wandb project in ``egomimic/hydra_configs/logger/wandb.yaml``
+
+## Submitit modification
+For the integrated hydra submitit plugin to work, make the following modification...
+
+`/path/to/your/venv/emimic/lib/python3.11/site-packages/hydra_plugins/hydra_submitit_launcher/submitit_launcher.py`
+
+Change line 144 to
+```
+        jobs = executor.map_array(self, *zip(*job_params))
+
+        return [asyncLauncher() for j in jobs]
+
+class asyncLauncher:
+    def __init__(self):
+        self.return_value = 0
+```
+
+I wanted to package this change nicely, but the hydra package is built very weirdly.
+
+## Quick Start Guide
+### Data Visualization
+Visit https://partners.mecka.ai/egoverse to view our entire dataset in the web!
+
+To visualize data programatically see [``zarr_data_viz.ipynb``](./egomimic/scripts/tutorials/zarr_data_viz.ipynb)
+
+To programatically view the SQL table of all episodes + metadata see [``sql_tutorial.ipynb``](./egomimic/scripts/tutorials//sql_tutorial.ipynb)
+
+#### Interactive Dataset Browser
+
+`latent_inspector.py` also ships a local web app for browsing a **folder of per-episode zarrs** — scrub any episode, overlay the recorded actions (cartesian trajectory / orientation axes / MANO keypoints), and toggle language annotations. Frames are rendered server-side using each episode's `zarr.json` camera intrinsics, so it works for any embodiment (the overlay is drawn by that episode's embodiment class, e.g. `Human`/`Eva`; human poses are projected in the head frame).
+
+```bash
+python egomimic/scripts/data_visualization/latent_inspector.py \
+    --dataset-path /path/to/folder_of_zarrs \
+    --host 127.0.0.1 --port 8050
+# then open http://localhost:8050
+```
+
+`--dataset-path` is a directory of `<episode>.zarr` stores (each with `images.front_1`, `left/right.obs_ee_pose`, `obs_head_pose`, optional `*.obs_keypoints` and `annotations`, and `intrinsics` in its `zarr.json`). In the browser: pick an episode (searchable by filename or annotation text), scrub the frame slider or press ▶ to play, choose an overlay (None / Cartesian / Orientation / Keypoints), and toggle annotations on/off.
+
+To browse data on a remote machine, run the app there and forward the port — `ssh -L 8050:<node>:8050 <host>` — then open `http://localhost:8050` (rendering locally is far more responsive than over the tunnel).
+
+### Data Downloading
+While our training pipeline automatically downloads data, you can manually download data via [``sync_s3.py``](./egomimic/scripts/data_download/sync_s3.py)
+
+For example, to download all our flagship Aria fold clothes data...
+```
+python egomimic/scripts/data_download/sync_s3.py \
+     --local-dir <local directory> \
+     --filters aria-fold-clothes
+```
+
+### Training
+Basic training run (robot BC)...
+``` bash
+python egomimic/trainHydra.py --config-name=train_zarr_cartesian
+```
+For full instructions on training see [``training.md``](./training.md)
+
+### Converting your own data
+See [``embodiment_tutorial.ipynb``](./egomimic/scripts/tutorials/embodiment_tutorial.ipynb) as reference to write a conversion script for your own data.
