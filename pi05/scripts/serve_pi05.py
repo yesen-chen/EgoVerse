@@ -15,15 +15,26 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument(
+        "--rtc",
+        action="store_true",
+        help="Enable training-free denoised-prefix VJP guidance",
+    )
+    parser.add_argument("--rtc-max-guidance", type=float, default=5.0)
     args = parser.parse_args()
     if not args.host.strip() or not 1 <= args.port <= 65535:
         parser.error("A nonempty host and port 1..65535 are required")
     setup(cpu=args.check_only, openpi_root=args.openpi_root)
     from egoverse_pi05.assets import inference_summary, load_inference_assets
+    from egoverse_pi05.rtc import RtcConfig
 
     assets = load_inference_assets(args.checkpoint_path, args.num_inference_steps)
+    rtc_config = RtcConfig(args.rtc_max_guidance) if args.rtc else None
+    summary = inference_summary(assets.metadata)
+    if rtc_config is not None:
+        summary["rtc"] = rtc_config.metadata()
     print(
-        json.dumps(inference_summary(assets.metadata), indent=2, ensure_ascii=False),
+        json.dumps(summary, indent=2, ensure_ascii=False),
         flush=True,
     )
     if args.check_only:
@@ -32,10 +43,10 @@ def main():
     from egoverse_pi05.inference import create_policy, warmup_policy
     from openpi.serving.websocket_policy_server import WebsocketPolicyServer
 
-    policy = create_policy(assets, require_single_gpu=True)
+    policy = create_policy(assets, require_single_gpu=True, rtc_config=rtc_config)
     result = warmup_policy(policy, assets)
     print(
-        f"PI05 WARMUP PASSED: {result['actions'].shape}; serving {args.host}:{args.port}",
+        f"PI05 WARMUP PASSED: {result['actions'].shape}; RTC={'on, guided + zero-mask warmed' if args.rtc else 'off'}; serving {args.host}:{args.port}",
         flush=True,
     )
     WebsocketPolicyServer(

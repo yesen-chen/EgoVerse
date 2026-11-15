@@ -8,15 +8,31 @@ from egoverse_pi05.assets import CAMERAS
 
 
 class BimanualInferencePolicy:
-    def __init__(self, policy, metadata):
+    def __init__(self, policy, metadata, *, rtc_runner=None, rtc_config=None):
         self._policy = policy
         self._metadata = copy.deepcopy(metadata)
+        self._rtc_runner = rtc_runner
+        if rtc_config is not None:
+            if rtc_runner is None:
+                raise ValueError("RTC capability requires a guided sampler")
+            self._metadata["rtc"] = rtc_config.metadata()
 
     @property
     def metadata(self):
         return copy.deepcopy(self._metadata)
 
-    def infer(self, observation):
+    def infer(self, observation, *, noise=None):
+        observation = dict(observation)
+        has_rtc_request = "rtc" in observation
+        rtc_request = observation.pop("rtc", None)
+        if has_rtc_request:
+            from egoverse_pi05.rtc import validate_request
+
+            if self._rtc_runner is None:
+                raise ValueError(
+                    "RTC is not enabled on this server; restart with --rtc"
+                )
+            rtc_request = validate_request(rtc_request)
         expected = {
             "observation.state",
             "prompt",
@@ -38,7 +54,16 @@ class BimanualInferencePolicy:
             or not observation["prompt"].strip()
         ):
             raise ValueError("A nonempty task prompt is required")
-        result = dict(self._policy.infer(observation))
+        if rtc_request is not None:
+            result = dict(self._rtc_runner.infer(observation, rtc_request, noise=noise))
+            result["rtc"] = {
+                "schema": rtc_request["schema"],
+                "request_id": rtc_request["request_id"],
+            }
+        elif noise is not None:
+            result = dict(self._policy.infer(observation, noise=noise))
+        else:
+            result = dict(self._policy.infer(observation))
         actions = np.asarray(result["actions"], dtype=np.float32)
         if actions.shape != (100, 14) or not np.isfinite(actions).all():
             raise ValueError("Pi0.5 returned invalid physical action chunk")
@@ -49,7 +74,7 @@ class BimanualInferencePolicy:
         self._policy.reset()
 
 
-def create_policy(assets, *, require_single_gpu=False):
+def create_policy(assets, *, require_single_gpu=False, rtc_config=None):
     import jax
     import jax.numpy as jnp
     from openpi import transforms
@@ -97,7 +122,14 @@ def create_policy(assets, *, require_single_gpu=False):
         sample_kwargs={"num_steps": assets.metadata["num_inference_steps"]},
         metadata=assets.metadata,
     )
-    return BimanualInferencePolicy(policy, assets.metadata)
+    rtc_runner = None
+    if rtc_config is not None:
+        from egoverse_pi05.rtc import RtcInference, make_sampler
+
+        rtc_runner = RtcInference(policy, make_sampler(network, rtc_config))
+    return BimanualInferencePolicy(
+        policy, assets.metadata, rtc_runner=rtc_runner, rtc_config=rtc_config
+    )
 
 
 def warmup_policy(policy, assets):
@@ -116,5 +148,24 @@ def warmup_policy(policy, assets):
         }
     )
     result = policy.infer(observation)
+    if "rtc" in policy.metadata:
+        from egoverse_pi05.rtc import SCHEMA
+
+        # Compile the guided graph, then exercise the disabled-guidance path.
+        # Neither touches a robot. Fully normalize the physical baseline output
+        # through the same prefix path used for subsequent remote requests.
+        for request_id, weights in enumerate(
+            (np.ones(100, dtype=np.float32), np.zeros(100, dtype=np.float32))
+        ):
+            guided_observation = dict(
+                observation,
+                rtc={
+                    "schema": SCHEMA,
+                    "request_id": request_id,
+                    "previous_actions": result["actions"].copy(),
+                    "weights": weights,
+                },
+            )
+            policy.infer(guided_observation)
     policy.reset()
     return result

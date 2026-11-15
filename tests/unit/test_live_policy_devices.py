@@ -1,5 +1,6 @@
 """Live device contracts tested without SDK, CAN, camera, GUI, or subprocesses."""
 
+import json
 import sys
 import threading
 import time
@@ -52,6 +53,44 @@ def fake_env(execute=True):
         home=Mock(),
         seed_clutches_from_measured=Mock(),
     )
+
+
+def test_rtc_health_readers_have_thread_owned_camera_buffers():
+    from concurrent.futures import ThreadPoolExecutor
+
+    barrier = threading.Barrier(2)
+    per_thread = {}
+
+    class Ring:
+        count = 1
+        get_time_budget = 5.0
+        buffer_size = 32
+
+        def get(self, out=None):
+            value = out if out is not None else {"timestamp": np.array(time.time())}
+            value["timestamp"][...] = time.time()
+            per_thread.setdefault(threading.get_ident(), []).append(value)
+            return value
+
+    camera = fake_device("front_1")
+    camera.ring = Ring()
+    env = fake_env(False)
+    env.cameras, env.camera_specs = [camera], [{"name": "front_1"}]
+    provider = LiveObservationProvider(env)
+
+    def read_twice():
+        provider.check_health()
+        barrier.wait(timeout=5)
+        provider.check_health()
+
+    with ThreadPoolExecutor(2) as pool:
+        a, b = pool.submit(read_twice), pool.submit(read_twice)
+        a.result(timeout=10)
+        b.result(timeout=10)
+    copies = list(per_thread.values())
+    assert len(copies) == 2
+    assert all(values[0] is values[1] for values in copies)
+    assert copies[0][0] is not copies[1][0]
 
 
 @pytest.mark.parametrize("enable", [False, True])
@@ -374,6 +413,79 @@ def test_live_send_requires_actual_worker_receipts():
     sink.send_action(np.zeros(14), time.time() + 1)
     assert len(sink.records[0]["receipts"]) == 2
     assert all(receipt["command_id"] == 7 for receipt in sink.records[0]["receipts"])
+    assert all(
+        receipt["measured_feedback"]["joint_vel_rad_s"] is None
+        for receipt in sink.records[0]["receipts"]
+    )
+
+
+def test_receipts_copy_existing_feedback_with_units_and_original_timestamps():
+    env = fake_env()
+    queued = time.time()
+    states = []
+    for index, arm in enumerate(env.arms):
+        state = feedback()
+        state.update(
+            ee_pose=np.arange(6, dtype=np.float64) + index,
+            joint_vel=np.arange(6, dtype=np.float64) / 100,
+            gripper_position=np.float64(0.04 + index * 0.01),
+            last_command_id=7,
+            last_command_send_timestamp=queued + 0.001,
+            robot_pose_source_timestamp=queued - 0.01,
+        )
+        states.append(state)
+        arm.get_state.side_effect = None
+        arm.get_state.return_value = state
+    sink = LiveActionSink(env, execute=True)
+    receipts = sink._wait_receipts([7, 7], queued_at=queued)
+
+    # Logging reuses the poll's snapshot: it must not introduce another read.
+    for arm, state, receipt in zip(env.arms, states, receipts):
+        arm.get_state.assert_called_once_with()
+        measured = receipt["measured_feedback"]
+        assert measured["schema"] == "piper_measured_feedback_v1"
+        assert measured["frame"] == "arm_base"
+        assert measured["rotation_convention"] == "extrinsic_xyz_rpy"
+        np.testing.assert_array_equal(
+            measured["ee_pose_xyz_rpy_m_rad"], state["ee_pose"]
+        )
+        np.testing.assert_array_equal(measured["joint_pos_rad"], state["joint_pos"])
+        np.testing.assert_array_equal(measured["joint_vel_rad_s"], state["joint_vel"])
+        assert measured["gripper_position_m"] == state["gripper_position"]
+        for key in (
+            "robot_receive_timestamp",
+            "robot_joint_source_timestamp",
+            "robot_pose_source_timestamp",
+            "robot_gripper_source_timestamp",
+        ):
+            assert measured[key] == state[key]
+        assert measured["robot_pose_source_timestamp"] < receipt["host_send_timestamp"]
+
+    original = json.dumps(receipts, allow_nan=False, sort_keys=True)
+    for state in states:
+        for key in ("ee_pose", "joint_pos", "joint_vel"):
+            state[key][...] = 999
+        state["robot_pose_source_timestamp"] = -1
+    assert json.dumps(receipts, allow_nan=False, sort_keys=True) == original
+
+
+@pytest.mark.parametrize("velocity", [np.full(6, np.nan), np.zeros(5)])
+def test_receipt_optional_invalid_velocity_is_null(velocity):
+    env = fake_env()
+    queued = time.time()
+    for arm in env.arms:
+        arm.get_state.side_effect = None
+        arm.get_state.return_value = {
+            **feedback(),
+            "joint_vel": velocity,
+            "last_command_id": 7,
+            "last_command_send_timestamp": queued + 0.001,
+        }
+    receipts = LiveActionSink(env, execute=True)._wait_receipts(
+        [7, 7], queued_at=queued
+    )
+    assert all(r["measured_feedback"]["joint_vel_rad_s"] is None for r in receipts)
+    json.dumps(receipts, allow_nan=False)
 
 
 def test_queue_acceptance_is_not_execution_confirmation():

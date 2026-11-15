@@ -1,4 +1,4 @@
-"""Keyboard-operated synchronous policy deployment, independent of PICO.
+"""Keyboard-operated policy deployment with optional Pi0.5 RTC, independent of PICO.
 
 Importing this module never connects devices. Camera / CAN construction happens
 only after the explicit runtime calibration and training profile have passed
@@ -17,6 +17,7 @@ import os
 import select
 import sys
 import termios
+import threading
 import time
 import tty
 import uuid
@@ -40,6 +41,13 @@ def _positive_float(value):
     number = float(value)
     if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError("must be finite and positive")
+    return number
+
+
+def _nonnegative_float(value):
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
     return number
 
 
@@ -119,7 +127,55 @@ def build_parser():
         "--execute-steps",
         type=_positive_int,
         default=30,
-        help="Prefix length AFTER time-preserving resampling",
+        help="Prefix length AFTER time-preserving resampling; with --rtc, request period = steps/control_frequency from the previous request; with --async-inference, sends before requesting the next chunk",
+    )
+    parser.add_argument(
+        "--rtc",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pi0.5 RTC: asynchronous inference with model prefix guidance; requires server --rtc and a shorter --execute-steps (e.g. 12)",
+    )
+    parser.add_argument(
+        "--rtc-delay-ms",
+        type=_positive_float,
+        default=200.0,
+        help="RTC observation/inference deadline; takeover uses the next control tick with guarded prefix coverage; late results pause execution (default 200 ms)",
+    )
+    parser.add_argument(
+        "--async-inference",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Infer the next chunk while the current one runs, time-aligned by the training observation_to_send_s, then crossfade",
+    )
+    parser.add_argument(
+        "--rtc-transition-ms",
+        type=_nonnegative_float,
+        default=200.0,
+        help="RTC execution pose transition duration (quintic, default 200 ms; 0 disables)",
+    )
+    parser.add_argument(
+        "--rtc-smoothing-ms",
+        type=_nonnegative_float,
+        default=100.0,
+        help="RTC centred within-prediction pose smoothing window (default about 100 ms; 0 disables)",
+    )
+    parser.add_argument(
+        "--rtc-max-position-gap-mm",
+        type=_positive_float,
+        default=20.0,
+        help="Reject RTC takeover when old/new trajectories disagree beyond this distance in the transition window",
+    )
+    parser.add_argument(
+        "--rtc-max-rotation-gap-deg",
+        type=_positive_float,
+        default=5.0,
+        help="Reject RTC takeover when SO(3) disagreement exceeds this in the transition window",
+    )
+    parser.add_argument(
+        "--blend-steps",
+        type=int,
+        default=5,
+        help="With --async-inference: control intervals to crossfade old -> new chunk (0 = hard switch)",
     )
     parser.add_argument(
         "--inference-steps",
@@ -221,6 +277,8 @@ class SessionLog:
         self.enabled = bool(getattr(args, "log", True))
         self._closed = False
         self._warnings = set()
+        # The streaming loop's inference thread may publish gripper events.
+        self._publish_lock = threading.Lock()
         self.summary = {
             "status": "initializing",
             "execute": bool(args.execute),
@@ -228,6 +286,8 @@ class SessionLog:
             "prediction_count": 0,
             "action_count": 0,
             "schedule_pause_count": 0,
+            "rtc_pause_count": 0,
+            "rtc_pause_reasons": {},
             "inference_elapsed_total_s": 0.0,
             "max_inference_elapsed_s": 0.0,
             "max_action_interval_s": None,
@@ -250,7 +310,9 @@ class SessionLog:
         if self._writer is not None:
             # Queue transport is asynchronous: never lend mutable predictions,
             # receipts or executor reports to its feeder thread.
-            self._writer.submit(kind, copy.deepcopy(value))
+            value = copy.deepcopy(value)
+            with self._publish_lock:
+                self._writer.submit(kind, value)
 
     def event(self, name, **fields):
         if self.enabled:
@@ -301,6 +363,11 @@ class SessionLog:
             )
 
     def cycle(self, report):
+        if report.get("timing_mode") == "rtc" and report.get("status") == "paused":
+            self.summary["rtc_pause_count"] += 1
+            reason = report.get("pause_reason", "unknown")
+            reasons = self.summary["rtc_pause_reasons"]
+            reasons[reason] = reasons.get(reason, 0) + 1
         if report.get("pause_reason") == "schedule_slip":
             self.summary["schedule_pause_count"] += 1
         if "observation_timestamp" in report:
@@ -356,14 +423,21 @@ class LoggedSink:
         self.provider.check_health()
         started = self.monotonic()
         receipt = self.sink.send_action(row, deadline)
+        finished = self.monotonic()
         self.log.command(
             row,
             deadline,
             started,
-            self.monotonic(),
+            finished,
             receipt,
             health_check_elapsed_s=started - health_started,
         )
+        # RTC measures cadence after variable-cost health checks. This is a
+        # host submission time, not proof that the robot reached its target.
+        return {
+            "send_started_monotonic": started,
+            "send_finished_monotonic": finished,
+        }
 
     def hold(self, reason):
         try:
@@ -383,8 +457,12 @@ class ActuatorPolicy:
         if not math.isfinite(self.open_m) or self.open_m <= 0:
             raise ValueError("gripper opening must be finite and positive")
 
-    def predict(self, frame):
-        prediction = self.policy.predict(frame)
+    def predict(self, frame, *, rtc=None):
+        prediction = (
+            self.policy.predict(frame)
+            if rtc is None
+            else self.policy.predict(frame, rtc=rtc)
+        )
         actions = np.asarray(prediction["base_actions"], dtype=float).copy()
         if (
             actions.shape != (self.timing.output_chunk_length, 14)
@@ -554,6 +632,13 @@ def load_policy_contract(args, log):
     if args.home_on_start and not args.execute:
         raise ValueError("--home-on-start true 需要 --execute；只观察模式不会回 home。")
     backend = getattr(args, "policy_backend", "hpt")
+    if getattr(args, "rtc", False):
+        if backend != "pi05":
+            raise ValueError("--rtc 当前只支持 Pi0.5 JAX 后端。")
+        if getattr(args, "async_inference", False):
+            raise ValueError(
+                "--rtc 与 --async-inference 不能同时使用；RTC 已包含异步执行。"
+            )
     if backend == "hpt" and getattr(args, "checkpoint", None) is None:
         raise ValueError("HPT 后端需要 --checkpoint。")
     if backend == "pi05" and not getattr(args, "server_url", None):
@@ -641,6 +726,48 @@ def _finish_policy_contract(args, log, contract, policy, source):
         args.control_frequency,
         execute_steps=args.execute_steps,
     ).to_report()
+    streaming = None
+    rtc = None
+    if getattr(args, "rtc", False):
+        from egomimic.robot.piper_pico.policy_rtc import check_rtc_schedule
+
+        capability = policy.require_rtc()
+        rtc = {
+            **check_rtc_schedule(
+                policy.timing,
+                args.control_frequency,
+                args.execute_steps,
+                args.rtc_delay_ms / 1000,
+                transition_s=args.rtc_transition_ms / 1000,
+            ),
+            "server": capability,
+            "observation_to_send_s": policy.observation_to_send_s,
+            "smoothing_s": args.rtc_smoothing_ms / 1000,
+            "max_position_gap_m": args.rtc_max_position_gap_mm / 1000,
+            "max_rotation_gap_rad": np.deg2rad(args.rtc_max_rotation_gap_deg),
+        }
+        if args.rtc_smoothing_ms / 1000 >= policy.timing.effective_span_s:
+            raise ValueError(
+                "RTC smoothing window must be shorter than the prediction horizon"
+            )
+    if getattr(args, "async_inference", False):
+        from egomimic.robot.piper_pico.policy_streaming import (
+            check_streaming_schedule,
+        )
+
+        if args.blend_steps < 0:
+            raise ValueError("--blend-steps 不能为负数。")
+        streaming = {
+            **check_streaming_schedule(
+                policy.timing,
+                args.control_frequency,
+                args.execute_steps,
+                args.blend_steps,
+            ),
+            "observation_to_send_s": contract["metadata"]["time_alignment"][
+                "observation_to_send_s"
+            ],
+        }
     manifest = {
         "schema": "piper_live_policy_v1",
         **source,
@@ -650,7 +777,13 @@ def _finish_policy_contract(args, log, contract, policy, source):
         "action_timing": policy.timing.to_dict(),
         "schedule": schedule,
         "coordinate_transform": "JSON T_base_camera; inverse for observations, forward for actions",
-        "timing_mode": "synchronous; offset zero after inference; no latency compensation",
+        "timing_mode": "rtc; model prefix guidance on timestamp-aligned 100-point grid; fixed inference deadline and guarded control-tick takeover; request-start cadence; configured execution pose conditioning"
+        if rtc
+        else "streaming; chunk offset s at observation + observation_to_send_s + s; crossfade between chunks"
+        if streaming
+        else "synchronous; offset zero after inference; no latency compensation",
+        "streaming": streaming,
+        "rtc": rtc,
         "workspace_limits": None,
         "step_limits": None,
         "gripper_open_m": open_m,
@@ -660,12 +793,37 @@ def _finish_policy_contract(args, log, contract, policy, source):
         "home_on_start": args.home_on_start,
     }
     log.write_manifest(manifest)
-    print(
-        f"[推理] {policy.timing.output_chunk_length} → {schedule['full_point_count']} 点，"
-        f"首尾 {policy.timing.effective_span_s:.3f} s；每轮执行前 "
-        f"{schedule['selected_point_count']} 点，目标 {schedule['actual_control_frequency']:.2f} Hz。",
-        flush=True,
-    )
+    if not rtc:
+        print(
+            f"[推理] {policy.timing.output_chunk_length} → {schedule['full_point_count']} 点，"
+            f"首尾 {policy.timing.effective_span_s:.3f} s；每轮执行前 "
+            f"{schedule['selected_point_count']} 点，目标 {schedule['actual_control_frequency']:.2f} Hz。",
+            flush=True,
+        )
+    if rtc:
+        print(
+            f"[推理] RTC：从上次请求起每 {rtc['replan_interval_s'] * 1000:g} ms 重新观察，"
+            f"推理期限 {args.rtc_delay_ms:g} ms，接管对齐控制节拍；"
+            f"前缀保护额外 {rtc['takeover_guard_s'] * 1000:.1f} ms 并覆盖右侧插值点。"
+            f"预测保留 {policy.timing.output_chunk_length} 点 / {policy.timing.effective_span_s:.3f} s，"
+            f"目标 {args.control_frequency:g} Hz；超时或错过前缀保护范围会保持并暂停。",
+            flush=True,
+        )
+        print(
+            f"[推理] RTC 执行连续性：位姿过渡 {args.rtc_transition_ms:g} ms，"
+            f"段内平滑约 {args.rtc_smoothing_ms:g} ms；夹爪保持原时机。"
+            f"过渡窗口预测分歧超过 {args.rtc_max_position_gap_mm:g} mm / "
+            f"{args.rtc_max_rotation_gap_deg:g}° 会保持并暂停。",
+            flush=True,
+        )
+    if streaming:
+        print(
+            f"[推理] 流水线推理：每 {args.execute_steps} 点取新观测，"
+            f"交叉过渡 {args.blend_steps} 点，按训练 observation_to_send "
+            f"{streaming['observation_to_send_s'] * 1000:.1f} ms 对齐；"
+            f"推理延迟上限 {streaming['max_inference_latency_s'] * 1000:.0f} ms。",
+            flush=True,
+        )
     extrinsics = contract["metadata"]["extrinsics"]
     identity = all(
         np.allclose(extrinsics[side], np.eye(4), atol=1e-10, rtol=0)
@@ -761,6 +919,38 @@ def _run_device_session(args, log, contract, policy, limits):
                 flush=True,
             )
             print("[推理] 按键请在终端操作；预览窗口 Q 只关闭窗口。", flush=True)
+            if getattr(args, "rtc", False):
+                from egomimic.robot.piper_pico.policy_rtc import run_rtc_loop
+
+                return run_rtc_loop(
+                    policy,
+                    provider,
+                    sink,
+                    keys,
+                    limits,
+                    log,
+                    args,
+                    observation_to_send_s=contract["metadata"]["time_alignment"][
+                        "observation_to_send_s"
+                    ],
+                )
+            if getattr(args, "async_inference", False):
+                from egomimic.robot.piper_pico.policy_streaming import (
+                    run_streaming_loop,
+                )
+
+                return run_streaming_loop(
+                    policy,
+                    provider,
+                    sink,
+                    keys,
+                    limits,
+                    log,
+                    args,
+                    observation_to_send_s=contract["metadata"]["time_alignment"][
+                        "observation_to_send_s"
+                    ],
+                )
             return run_live_loop(policy, provider, sink, keys, limits, log, args)
         except InterruptedError:
             if keys.poll() == "stop":

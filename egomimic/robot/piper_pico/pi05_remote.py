@@ -264,7 +264,60 @@ class Pi05RemotePolicy:
         rpc = (rpc_factory or WebSocketRPC)(url, timeout_s=timeout_s)
         return cls(rpc, metadata, task_description=task_description)
 
-    def predict(self, frame):
+    def require_rtc(self):
+        """Check server capability before opening any robot devices."""
+        capability = self.server_metadata.get("rtc")
+        if (
+            not isinstance(capability, Mapping)
+            or capability.get("schema") != "egoverse_rtc_v1"
+            or isinstance(capability.get("max_guidance"), bool)
+            or not isinstance(capability.get("max_guidance"), (int, float))
+            or not math.isfinite(capability["max_guidance"])
+            or capability["max_guidance"] <= 0
+        ):
+            raise ValueError(
+                "RTC requires a compatible Pi0.5 server started with --rtc; "
+                "restart the server with RTC enabled."
+            )
+        return copy.deepcopy(capability)
+
+    def _rtc_request(self, rtc):
+        self.require_rtc()
+        expected = {"schema", "base_actions", "weights", "request_id"}
+        if not isinstance(rtc, Mapping) or set(rtc) != expected:
+            raise ValueError(f"RTC client prefix requires exactly {sorted(expected)}")
+        if rtc["schema"] != "egoverse_rtc_v1":
+            raise ValueError("Unsupported RTC prefix schema")
+        if type(rtc["request_id"]) is not int or rtc["request_id"] < 0:
+            raise ValueError("RTC request_id must be a nonnegative integer")
+        previous = np.asarray(rtc["base_actions"])
+        weights = np.asarray(rtc["weights"])
+        if (
+            previous.dtype.kind not in "iuf"
+            or previous.shape != (100, 14)
+            or not np.isfinite(previous).all()
+            or weights.dtype.kind not in "iuf"
+            or weights.shape != (100,)
+            or not np.isfinite(weights).all()
+            or np.any((weights < 0) | (weights > 1))
+        ):
+            raise ValueError(
+                "RTC needs finite (100,14) base actions and 100 weights in [0,1]"
+            )
+        # Prefixes use the same calibrated camera XYZ/YPR and normalized-width
+        # representation as training actions. Quantile normalization stays on
+        # the server; a base rotvec or a metre width must never enter that model.
+        camera = np.stack(
+            [self.adapter.base_to_camera_state(row) for row in previous]
+        ).astype(np.float32)
+        return {
+            "schema": rtc["schema"],
+            "request_id": rtc["request_id"],
+            "previous_actions": camera,
+            "weights": weights.astype(np.float32, copy=True),
+        }
+
+    def predict(self, frame, *, rtc=None):
         if self.rpc is None:
             raise RuntimeError("Pi0.5 connection is closed; restart the session")
         try:
@@ -277,10 +330,21 @@ class Pi05RemotePolicy:
                 request[f"observation.images.{name}"] = np.ascontiguousarray(
                     batch[key][0].numpy().transpose(1, 2, 0)
                 )
+            if rtc is not None:
+                request["rtc"] = self._rtc_request(rtc)
             started = time.perf_counter()
             response = self.rpc.infer(request)
             if not isinstance(response, Mapping) or "error" in response:
                 raise ValueError("Malformed Pi0.5 inference response")
+            if rtc is not None:
+                receipt = response.get("rtc")
+                if (
+                    not isinstance(receipt, Mapping)
+                    or receipt.get("schema") != "egoverse_rtc_v1"
+                    or type(receipt.get("request_id")) is not int
+                    or receipt["request_id"] != rtc["request_id"]
+                ):
+                    raise ValueError("Missing or mismatched RTC response request_id")
             actions = np.asarray(response.get("actions"))
             if (
                 actions.dtype.kind not in "iuf"
@@ -298,6 +362,7 @@ class Pi05RemotePolicy:
                 "observation_timestamp": frame.timestamp,
                 "inference_elapsed_s": time.perf_counter() - started,
                 "inference_steps": self.inference_steps,
+                **({"rtc": copy.deepcopy(response["rtc"])} if rtc is not None else {}),
             }
         except BaseException:
             self.close()

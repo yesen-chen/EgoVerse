@@ -6,6 +6,7 @@ their SDK send method, not that either robot reached the commanded position.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from dataclasses import replace
@@ -61,19 +62,24 @@ class LiveObservationProvider:
         if not np.isfinite(self.max_source_age_s) or self.max_source_age_s <= 0:
             raise ValueError("max_source_age_s must be positive")
         self.camera_names = [spec["name"] for spec in env.camera_specs]
-        self._camera_buffers = {}
+        # RTC reads observations on its inference worker while the control
+        # thread checks source freshness. Each reader must own its copies.
+        self._reader_local = threading.local()
 
     def check_health(self):
         """Check current frame/feedback freshness without another device reader."""
         now = time.time()
         sources = {}
+        buffers = getattr(self._reader_local, "camera_buffers", None)
+        if buffers is None:
+            buffers = self._reader_local.camera_buffers = {}
         for camera in self.env.cameras:
             _alive(camera)
             ring = camera.ring
             before = ring.count
             started = time.monotonic()
-            state = ring.get(out=self._camera_buffers.get(camera.name))
-            self._camera_buffers[camera.name] = state
+            state = ring.get(out=buffers.get(camera.name))
+            buffers[camera.name] = state
             # Reuse owned snapshots, never lend live shared memory to consumers.
             # A slow/wrapped copy is rejected; the camera writer never waits on
             # this reader and these checks never touch its read/write counters.
@@ -148,6 +154,13 @@ class LiveActionSink:
         return self.records[-1] if self.records else None
 
     def _wait_receipts(self, command_ids, *, queued_at, should_stop=None):
+        """Confirm SDK calls and retain the feedback already read in that poll.
+
+        Feedback is the latest cached measurement, not a reached-target receipt
+        or an atomic measurement at ``host_send_timestamp``. Its CAN timestamps
+        may precede the send. ``robot_joint_source_timestamp`` describes joint
+        positions; this worker does not expose a separate velocity timestamp.
+        """
         deadline = time.monotonic() + self.command_timeout_s
         while True:
             if should_stop is not None and should_stop():
@@ -163,11 +176,39 @@ class LiveActionSink:
                     )
                 sent_at = float(state["last_command_send_timestamp"])
                 if actual == expected and np.isfinite(sent_at) and sent_at >= queued_at:
+                    velocity = np.asarray(state.get("joint_vel", []), dtype=np.float64)
+                    measured = {
+                        "schema": "piper_measured_feedback_v1",
+                        "frame": "arm_base",
+                        "rotation_convention": "extrinsic_xyz_rpy",
+                        "ee_pose_xyz_rpy_m_rad": np.asarray(
+                            state["ee_pose"], dtype=np.float64
+                        ).tolist(),
+                        "joint_pos_rad": np.asarray(
+                            state["joint_pos"], dtype=np.float64
+                        ).tolist(),
+                        "joint_vel_rad_s": (
+                            velocity.tolist()
+                            if velocity.shape == (6,) and np.isfinite(velocity).all()
+                            else None
+                        ),
+                        "gripper_position_m": float(state["gripper_position"]),
+                        **{
+                            key: float(state[key])
+                            for key in (
+                                "robot_receive_timestamp",
+                                "robot_joint_source_timestamp",
+                                "robot_pose_source_timestamp",
+                                "robot_gripper_source_timestamp",
+                            )
+                        },
+                    }
                     receipts.append(
                         {
                             "arm": arm.name,
                             "command_id": actual,
                             "host_send_timestamp": sent_at,
+                            "measured_feedback": measured,
                         }
                     )
             if len(receipts) == len(self.env.arms):

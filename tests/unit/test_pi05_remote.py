@@ -442,15 +442,18 @@ def loopback_server(metadata, *, stall=False):
                 if stall:
                     await asyncio.sleep(0.3)
                 else:
-                    await socket.send_bytes(
-                        pack_message(
-                            {
-                                "actions": np.repeat(
-                                    observation["observation.state"][None], 100, axis=0
-                                )
-                            }
+                    result = {
+                        "actions": np.repeat(
+                            observation["observation.state"][None], 100, axis=0
                         )
-                    )
+                    }
+                    if "rtc" in observation:
+                        result["actions"] = observation["rtc"]["previous_actions"]
+                        result["rtc"] = {
+                            "schema": observation["rtc"]["schema"],
+                            "request_id": observation["rtc"]["request_id"],
+                        }
+                    await socket.send_bytes(pack_message(result))
         return socket
 
     async def setup():

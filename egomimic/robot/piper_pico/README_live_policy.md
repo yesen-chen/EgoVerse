@@ -2,6 +2,16 @@
 
 `python -m egomimic.scripts.infer_piper_policy` 使用三台 UVC 相机、双臂 SDK 实际反馈和本地 checkpoint 进行同步推理，通过终端键盘开始、暂停和退出。**不需要 PICO 头显、手柄或 `runService.sh`。** 加 `--offline-eval` 则使用录制数据完成离线误差验证，不打开硬件；另有 [离线策略回放](/home/yesen/pico_ego_probe/EgoVerse/egomimic/robot/piper_pico/README_policy_inference.md) 用于虚拟时间调度检查。
 
+Pi0.5 JAX 远程服务支持可选 `--rtc`：模型前缀引导与后台推理配合执行，保留100点训练动作与标定约定。服务端也要启用 `--rtc`，客户端建议从 `--execute-steps 12 --rtc-delay-ms 200` 开始。RTC 的12点表示相邻请求起点相隔目标 `12/30=0.4` 秒，下一请求从上次实际请求时刻计时。完整命令及不连接真机的测试见 [Pi0.5 README 的 RTC 部分](/home/yesen/pico_ego_probe/EgoVerse/pi05/README.md#rtc在模型内部约束相邻动作段)。以下未启用 RTC 的同步行为保持不变。
+
+启用 RTC 后，客户端默认另外使用执行连续性层：`--rtc-transition-ms 200` 用五次 smoothstep 在同一绝对时刻的旧、新轨迹之间衔接位置和 SO(3) 短弧姿态；`--rtc-smoothing-ms 100` 对完整新预测做居中位姿滤波，当前100点网格采用SG11/3阶，实际窗口约97.6ms。**夹爪既不滤波，也不blend，保持新计划原本的开合时机。** 首次开始或暂停恢复时，从本次实测反馈渐入。过渡结束后使用新计划，预测时间轴不延长；后续模型RTC前缀来自包含过渡的执行计划。这是原RTC之外的执行层，不表示模型引导本身已保证连续。
+
+接续前，程序检查完整过渡窗口（含接管漂移余量）内旧执行计划与平滑新计划的分歧。任一臂最大位置差超过默认20mm或SO(3)旋转差超过5°，以 `rtc_plan_disagreement` 保持并暂停，拒绝接管；检查状态后按空格重新观察恢复。首次/恢复只核对起始预测与实测反馈的差异，后续正常任务运动不按恒定反馈整窗拒绝。被拒绝的段不能算作成功执行。阈值分别由 `--rtc-max-position-gap-mm`、`--rtc-max-rotation-gap-deg` 配置。传 `--rtc-transition-ms 0 --rtc-smoothing-ms 0` 可对照纯RTC，同时关闭这层滤波、过渡及分歧检查；原有时间和数据有效性检查仍保留。
+
+RTC 的结果截止时间与接管时刻分开：200ms是读取观测、推理和结果检查的严格预算；合格结果在截止时间之后的计划控制 tick、实际准备发送命令时接入。硬前缀覆盖该 tick、一个控制周期的漂移裕量及右侧100点模型插值节点。首条新目标若超出硬前缀支持范围，就保持并暂停，不切入软尾。旧段 horizon 之外不会重复末点作为约束。实际取样时刻与主机提交时刻分别记录为 `first_target_walltime`、`first_send_monotonic`；`switch_plan_delta` 比较同一取样时刻的新旧计划。
+
+RTC 配置要求 `P > D + 2Δ`、`0 <= T < P`，且 `P + D + 2Δ + g + T < H`：其中 `P=execute_steps/频率`、`D=rtc_delay_ms/1000`、`T=rtc_transition_ms/1000`、`Δ=1/频率`、`g` 为最大模型点间隔、`H` 为预测跨度。当前30Hz、100点对应 `g≈9.76ms`、`H≈0.967s`。需要300ms预算时可用 `--execute-steps 12 --rtc-delay-ms 300 --rtc-transition-ms 150`；保留默认200ms过渡则总时域约976ms，超出预测跨度，会被拒绝。旧的6点示例也不满足请求周期要求。运行时复核旧、新计划剩余时域，不外推旧段或静默缩短过渡。引导上限5、flow步数10和100点输出保持不变；应同时核对模型残差、整段执行轨迹和任务效果。
+
 ## 当前训练的完整命令
 
 在交互终端运行，使用已经保存完成的 epoch 权重。相机端口、采集参数和内参文件从 `uvc_rig.json` 读取；左右 CAN 默认 `can0`、`can1`。先退出占用相机或控制双臂的采集、遥操作、轨迹回放程序。
@@ -101,7 +111,9 @@ python -m egomimic.scripts.infer_piper_policy \
 
 动作下发相对本段计划迟到超过 100 ms 时，程序先请求双臂保持；保持成功后进入暂停状态，丢弃该段剩余动作。终端按空格重新取图像与实际反馈并推理，按 `Q` 退出。程序不会补发旧段，也不会自动恢复。相机/机械臂反馈失效、SDK 下发失败、时钟异常或保持失败仍会停止程序。只观察模式不会发送保持或运动命令。
 
-开启日志时，调度暂停在 `events.jsonl` 中记录为 `schedule_paused`，在 `cycles.jsonl` 中记录 `status=paused`、`pause_reason=schedule_slip`；内部 execution 保留超时原始错误及保持结果。`summary.json` 的 `schedule_pause_count` 汇总次数，关闭日志时也保留。每个动作的 `stage_timings` 记录键盘轮询、sleep 实际耗时及超时、验证和下发总耗时，`last_attempt` 保留未发送的失败动作；`commands.jsonl` 另记健康检查和 SDK 提交确认耗时。每个 chunk 也保存 `measured_base_state`，用于分析反馈位置与新预测的衔接；它不是逐点物理轨迹记录。分析前先核对 `summary.json` 中 `logging.incomplete`；队列丢弃会造成动作索引缺口，不能再假定不同日志文件完整且逐行对应。
+开启日志时，调度暂停在 `events.jsonl` 中记录为 `schedule_paused`，在 `cycles.jsonl` 中记录 `status=paused`、`pause_reason=schedule_slip`；内部 execution 保留超时原始错误及保持结果。`summary.json` 的 `schedule_pause_count` 汇总次数，关闭日志时也保留。每个动作的 `stage_timings` 记录键盘轮询、sleep 实际耗时及超时、验证和下发总耗时，`last_attempt` 保留未发送的失败动作；`commands.jsonl` 另记健康检查和 SDK 提交确认耗时。每个 chunk 保存 `measured_base_state`；每臂提交回执还保存当次确认循环读到的最新 `measured_feedback`，含末端位姿、关节位置、可用的关节速度、夹爪及来源时间戳。这不是发送瞬间的原子同步测量，反馈时间可能早于提交，也不表示已经到位。分析前先核对 `summary.json` 中 `logging.incomplete`；队列丢弃会造成动作索引缺口，不能再假定不同日志文件完整且逐行对应。
+
+RTC 的 `cycles.jsonl` 同时保留原始 `camera_actions` / `base_actions`、段内滤波后的100点 `execution_base_actions`、`execution_transition_s` / `execution_smoothing_s` 和整窗 `transition_disagreement`。`execution_base_actions` 尚未包含运行时过渡采样；实际提交目标以 `commands.jsonl` 为准。`raw_switch_plan_delta` 衡量原始新预测与旧执行计划的同时间差，`switch_plan_delta` 衡量执行过渡后的同时间差，不能只看后者接近零便认定模型问题消失。拒绝接管和其他RTC暂停另见 `rtc_paused` 事件及摘要的 `rtc_pause_count` / `rtc_pause_reasons`。
 
 这是同步实现：模型计算期间不会下发新预测。正在进行的一次模型计算不能被键盘中断；计算返回后再次检查按键，暂停或退出时丢弃结果。
 
@@ -146,6 +158,10 @@ python -m egomimic.scripts.infer_piper_policy \
 | `--control-frequency` | `30` | 动作重采样和下发目标频率 |
 | `--execute-steps` | `30` | 每轮执行的动作前缀点数 |
 | `--inference-steps` | `10` | 模型生成步骤数 |
+| `--rtc-transition-ms` | `200` | RTC执行位姿过渡时长；0关闭过渡及分歧检查 |
+| `--rtc-smoothing-ms` | `100` | RTC居中位姿滤波窗口约100ms；0关闭滤波 |
+| `--rtc-max-position-gap-mm` | `20` | RTC完整过渡窗口允许的最大旧、新位置分歧 |
+| `--rtc-max-rotation-gap-deg` | `5` | RTC完整过渡窗口允许的最大旧、新SO(3)角度分歧 |
 | `--move-spd-rate` | `50` | PiPER SDK 的速度百分比，范围 1–100 |
 | `--max-chunks` | 不限制 | 最多预测多少轮；不含启动预热 |
 | `--max-observation-age` | `0.5` 秒 | 观测/相机/机器人来源最大允许年龄 |
@@ -166,9 +182,20 @@ python -m egomimic.scripts.infer_piper_policy \
 | `events.jsonl` | 开启日志时：设备就绪、预热、home、开始/暂停/退出等事件 |
 | `commands.jsonl` | 开启日志时：只观察的候选动作，或实际执行时两臂的 SDK 提交确认 |
 
-SDK 提交确认表示主机侧两臂工作进程调用了 SDK 方法，**不等于机械臂已经运动到目标位置**。只观察日志明确标记没有发送机器人命令。加载或预检失败时仍保存参数和错误摘要，尚未完成的阶段不会产生完整 manifest。
+SDK 提交确认表示主机侧两臂工作进程调用了 SDK 方法，**不等于机械臂已经运动到目标位置**。回执里的 `measured_feedback.ee_pose_xyz_rpy_m_rad` 是各臂base坐标下的SDK末端反馈，单位米/弧度，旋转为 `extrinsic_xyz_rpy`；关节速度不可用时记录为null。只观察日志明确标记没有发送机器人命令。加载或预检失败时仍保存参数和错误摘要，尚未完成的阶段不会产生完整 manifest。
 
-该入口尚未完成真实硬件上的策略运行验收。软件检查和只观察模式可以验证输入、坐标与调度流程，不能代表任务成功率。
+当前新增执行连续性层尚未完成真实硬件运行验收。离线滤波/过渡对照、软件检查和只观察模式不能承诺真机平稳性或任务成功率，也不能修复模型错误目标；大分歧被拒绝必须单独报告。
+
+不连接真机的连续性与RTC接入测试：
+
+```bash
+cd /home/yesen/pico_ego_probe/EgoVerse
+source emimic/bin/activate
+CUDA_VISIBLE_DEVICES='' python -m pytest -q \
+  tests/unit/test_policy_continuity.py tests/unit/test_policy_rtc_continuity.py \
+  tests/unit/test_policy_rtc.py tests/unit/test_policy_rtc_timing.py \
+  tests/unit/test_live_policy_devices.py
+```
 
 查看所有参数：
 
