@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 from pathlib import Path
 
 import torch
 from omegaconf import OmegaConf
 
+from egomimic.rldb.ego_boundary_policy import EgoBoundaryPolicy
 from egomimic.rldb.embodiment.pico_ego import PicoEgoDataset
 from egomimic.rldb.filters import DatasetFilter
 from egomimic.rldb.zarr.piper_dataset import PiperDataset
@@ -63,22 +65,31 @@ class RecordingEpisode(torch.utils.data.Dataset):
             if path.is_file():
                 digest.update(name.encode())
                 digest.update(path.read_bytes())
+        if hasattr(self.leaf, "sample_window_contract"):
+            digest.update(
+                json.dumps(self.leaf.sample_window_contract, sort_keys=True).encode()
+            )
         return digest.hexdigest()
 
     def __getitem__(self, index):
         sample = self.leaf[index]
         sample["episode_hash"] = self.episode_id
         sample["recording_id"] = self.recording_id
-        sample["sample_index"] = index
+        source_index = (
+            self.leaf.source_index(index)
+            if hasattr(self.leaf, "source_index")
+            else index
+        )
+        sample["sample_index"] = source_index
         # Epoch seconds must not pass through the generic float32 conversion.
         store = self.leaf.episode_reader._store
         if "timestamp" in store:
             sample["sample_timestamp"] = torch.as_tensor(
-                store["timestamp"][index], dtype=torch.float64
+                store["timestamp"][source_index], dtype=torch.float64
             )
         if "timestamp_ns" in store:
             sample["sample_timestamp_ns"] = torch.as_tensor(
-                store["timestamp_ns"][index], dtype=torch.int64
+                store["timestamp_ns"][source_index], dtype=torch.int64
             )
         return sample
 
@@ -95,6 +106,8 @@ class LocalRecordingResolver(EpisodeResolver):
         allow_synthetic_calibration=False,
         gripper_mode="zero",
         expected_axis_convention="piper_x",
+        require_full_window_after_trim=True,
+        require_full_window_after_inactivity=True,
     ):
         super().__init__(folder_path, key_map, transform_list)
         if kind not in ("piper", "pico_ego"):
@@ -103,6 +116,9 @@ class LocalRecordingResolver(EpisodeResolver):
         self.allow_synthetic_calibration = allow_synthetic_calibration
         self.gripper_mode = gripper_mode
         self.expected_axis_convention = expected_axis_convention
+        self.boundary_policy = EgoBoundaryPolicy(
+            require_full_window_after_trim, require_full_window_after_inactivity
+        )
 
     def _memo_fields(self):
         return (str(self.folder_path.resolve()), self.kind)
@@ -152,6 +168,8 @@ class LocalRecordingResolver(EpisodeResolver):
             kwargs = {
                 "gripper_mode": self.gripper_mode,
                 "expected_axis_convention": self.expected_axis_convention,
+                "require_full_window_after_trim": self.boundary_policy.require_full_window_after_trim,
+                "require_full_window_after_inactivity": self.boundary_policy.require_full_window_after_inactivity,
             }
         datasets, errors = {}, []
         for path, name in paths:
@@ -295,6 +313,13 @@ def local_data_contracts(cfg):
                 contract["axis_convention"] = resolver.get(
                     "expected_axis_convention", "piper_x"
                 )
+                policy_fields = (
+                    "require_full_window_after_trim",
+                    "require_full_window_after_inactivity",
+                )
+                contract["future_window_policy"] = EgoBoundaryPolicy(
+                    **{field: resolver.get(field, True) for field in policy_fields}
+                ).to_dict()
             else:
                 contract["calibration"] = "per_episode_T_base_camera"
             if name in contracts and contracts[name] != contract:

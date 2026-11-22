@@ -66,7 +66,11 @@ class ActionTiming:
             np.linspace(0.0, self.effective_span_s, self.output_chunk_length).tolist()
         )
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, episode_end_padding: str | None = None) -> dict:
+        if episode_end_padding is not None and (
+            not isinstance(episode_end_padding, str) or not episode_end_padding
+        ):
+            raise ValueError("episode_end_padding description must be nonempty text")
         return {
             "schema": "action_timing_v1",
             **asdict(self),
@@ -76,7 +80,8 @@ class ActionTiming:
             "effective_span_s": self.effective_span_s,
             "support_indices": list(self.support_indices),
             "output_offsets_s": list(self.output_offsets_s),
-            "episode_end_padding": "repeat_last; offsets are nominal, not measured future observations",
+            "episode_end_padding": episode_end_padding
+            or "repeat_last; offsets are nominal, not measured future observations",
         }
 
 

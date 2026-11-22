@@ -61,7 +61,18 @@ def _build_model_config_tree(cfg: DictConfig) -> DictConfig:
     return OmegaConf.create(
         {
             "model": OmegaConf.to_container(model_cfg, resolve=True),
-            "action_timing": {name: spec.to_dict() for name, spec in timing.items()},
+            "action_timing": {
+                name: spec.to_dict(
+                    episode_end_padding=(
+                        "per_episode_end_reason; see data_contracts."
+                        f"{name}.future_window_policy; full-window starts use "
+                        "no padding, other starts repeat_last"
+                    )
+                    if "future_window_policy" in contracts.get(name, {})
+                    else None
+                )
+                for name, spec in timing.items()
+            },
             **({"data_contracts": contracts} if contracts else {}),
         }
     )

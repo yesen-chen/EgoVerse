@@ -3,6 +3,10 @@ piper_root: ${paths.root_dir}/data/piper_converted
 pico_ego_root: ${paths.root_dir}/data/pico_ego_converted
 gripper_mode: zero
 expected_axis_convention: piper_x
+# Ego artificial endings do not invent held future supervision by default.
+# false allows repeating the last action at this kind of episode ending.
+ego_require_full_window_after_trim: true
+ego_require_full_window_after_inactivity: true
 allow_synthetic_calibration: false
 # Retain finite out-of-distribution validation values; explicit original-policy opt-in.
 sample_policy: finite

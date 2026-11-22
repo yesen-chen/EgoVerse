@@ -39,6 +39,8 @@ data:
         kind: pico_ego
         gripper_mode: ${recordings.gripper_mode}
         expected_axis_convention: ${recordings.expected_axis_convention}
+        require_full_window_after_trim: ${recordings.ego_require_full_window_after_trim}
+        require_full_window_after_inactivity: ${recordings.ego_require_full_window_after_inactivity}
         key_map:
           _target_: egomimic.rldb.embodiment.pico_ego.PicoEgo.get_keymap
           keymap_mode: cartesian

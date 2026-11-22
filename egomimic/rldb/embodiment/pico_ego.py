@@ -16,6 +16,7 @@ import numpy as np
 import zarr
 
 from egomimic.rldb.action_timing import ActionTiming
+from egomimic.rldb.ego_boundary_policy import EgoBoundaryPolicy, action_source_horizon
 from egomimic.rldb.embodiment.embodiment import Embodiment
 from egomimic.rldb.embodiment.piper import coerce_timing
 from egomimic.rldb.zarr.action_chunk_transforms import (
@@ -309,9 +310,14 @@ class PicoEgoDataset(ZarrDataset):
         *,
         gripper_mode="zero",
         expected_axis_convention="piper_x",
+        require_full_window_after_trim=True,
+        require_full_window_after_inactivity=True,
     ):
         self.gripper_mode = _gripper_mode(gripper_mode)
         self.expected_axis_convention = expected_axis_convention
+        self.boundary_policy = EgoBoundaryPolicy(
+            require_full_window_after_trim, require_full_window_after_inactivity
+        )
         super().__init__(
             Path(Episode_path), copy.deepcopy(key_map), copy.deepcopy(transform_list)
         )
@@ -334,7 +340,31 @@ class PicoEgoDataset(ZarrDataset):
                 f"{Episode_path}: keymap disagrees with gripper_mode={gripper_mode!r}"
             )
 
-    def __getitem__(self, idx, **kwargs):
+        self.end_reason, self.requires_full_window = self.boundary_policy.resolve(
+            self.metadata, episode_path=Episode_path
+        )
+        self.source_horizon = action_source_horizon(
+            self.key_map, episode_path=Episode_path
+        )
+        eligible_count = self.total_frames
+        if self.requires_full_window:
+            eligible_count = max(0, self.total_frames - self.source_horizon + 1)
+            if eligible_count == 0:
+                raise ValueError(
+                    f"{Episode_path}: {self.end_reason} fragment has "
+                    f"{self.total_frames} rows but full future window needs "
+                    f"{self.source_horizon}; increase minimum segment duration "
+                    "or reduce source_horizon"
+                )
+        # These are training starts only. total_frames and all stored support
+        # arrays still contain the tail needed by the last eligible action chunk.
+        self.eligible_start_indices = range(eligible_count)
+
+    def __len__(self):
+        return len(self.eligible_start_indices)
+
+    def source_index(self, idx):
+        """Map a training sample index back to its row in the converted episode."""
         if (
             isinstance(idx, bool)
             or not isinstance(idx, Integral)
@@ -344,7 +374,23 @@ class PicoEgoDataset(ZarrDataset):
             raise IndexError(
                 f"{self.episode_path}: frame index {idx!r} outside episode"
             )
-        sample = super().__getitem__(idx, **kwargs)
+        return self.eligible_start_indices[idx]
+
+    @property
+    def sample_window_contract(self):
+        return {
+            **self.boundary_policy.to_dict(),
+            "end_reason": self.end_reason,
+            "episode_end_padding": "none"
+            if self.requires_full_window
+            else "repeat_last",
+            "source_horizon": self.source_horizon,
+            "stored_frames": self.total_frames,
+            "eligible_starts": len(self),
+        }
+
+    def __getitem__(self, idx, **kwargs):
+        sample = super().__getitem__(self.source_index(idx), **kwargs)
         if self.transform:
             dimensions = 12 if self.gripper_mode == "zero" else 14
             if (
