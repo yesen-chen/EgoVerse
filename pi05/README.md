@@ -16,7 +16,7 @@
 - `front_1/left_wrist/right_wrist` 分别映射到 `base_0_rgb/left_wrist_0_rgb/right_wrist_0_rgb`。
 - manifest 使用相对路径引用 Zarr，**不能只复制 manifest 而遗漏源 Zarr**。metadata 与数值数据参与身份校验，JPEG 内容不逐字节做哈希。
 
-当前实现完成 Piper 数据训练与部署；100 点表示和逐 episode 坐标处理为后续 ego 混合保留一致的入口。**尚未实现人手数据混合采样、缺失 wrist 图像 mask 和人手动作适配**，不能把任意 ego Zarr 直接交给本版 loader。
+Piper 单独训练仍沿用上述路径。PICO Ego 与 Piper 混合训练现已提供独立导出入口，支持各自的源动作窗口、Ego 完整未来窗口限制、分域归一化及缺失腕部图像 mask。详见 [PICO Ego 混合训练操作说明](README_pico_ego_mixed.md)。混合模型的机器人部署继续使用 Piper 时间和反归一化统计。
 
 ## 1. 用户配置 JAX 环境
 

@@ -122,11 +122,20 @@ def validate_manifest_contract(manifest):
 
 
 def build_contract(*, manifest, stats_path, tokenizer_path, finetune_mode, training):
-    validate_manifest_contract(manifest)
+    from egomimic.robot.piper_pico.pi05_training_data import (
+        SCHEMA as MIXED_SCHEMA,
+    )
+    from egomimic.robot.piper_pico.pi05_training_data import (
+        deployment_manifest,
+        load_training_stats,
+    )
+
+    robot_manifest = deployment_manifest(manifest)
+    validate_manifest_contract(robot_manifest)
     validate_stats(read_json(stats_path))
     if finetune_mode not in ("lora", "full"):
         raise ValueError("finetune_mode must be lora or full")
-    return {
+    result = {
         "schema": "egoverse_pi05_checkpoint_v1",
         "openpi_revision": OPENPI_REVISION,
         "protocol_version": 1,
@@ -137,9 +146,20 @@ def build_contract(*, manifest, stats_path, tokenizer_path, finetune_mode, train
         "finetune_mode": finetune_mode,
         "stats_sha256": sha256(stats_path),
         "tokenizer_sha256": sha256(tokenizer_path),
-        "manifest": copy.deepcopy(manifest),
+        "manifest": robot_manifest,
         "training": copy.deepcopy(training),
     }
+    if manifest["schema"] == MIXED_SCHEMA:
+        load_training_stats(manifest, Path(stats_path).parent)
+        result["training_manifest"] = copy.deepcopy(manifest)
+        result["domain_stats"] = {
+            "piper": {"filename": "norm_stats.json", "sha256": sha256(stats_path)},
+            "ego": {
+                "filename": "ego_norm_stats.json",
+                "sha256": sha256(Path(stats_path).parent / "ego_norm_stats.json"),
+            },
+        }
+    return result
 
 
 def write_portable_assets(directory, contract, stats_path, tokenizer_path):
@@ -153,6 +173,13 @@ def write_portable_assets(directory, contract, stats_path, tokenizer_path):
         if sha256(source) != digest:
             raise ValueError(f"Training asset changed while running: {source}")
         shutil.copyfile(source, target / name)
+    for domain, entry in contract.get("domain_stats", {}).items():
+        if domain == "piper":
+            continue
+        source = Path(stats_path).parent / entry["filename"]
+        if sha256(source) != entry["sha256"]:
+            raise ValueError(f"Training domain statistics changed: {domain}")
+        shutil.copyfile(source, target / entry["filename"])
     (target / "contract.json").write_text(
         json.dumps(contract, indent=2, ensure_ascii=False) + "\n"
     )
@@ -251,6 +278,39 @@ def load_inference_assets(checkpoint_path, num_inference_steps=10):
     validate_checkpoint_mode(checkpoint / "params/_METADATA", mode)
     manifest = contract["manifest"]
     validate_manifest_contract(manifest)
+    if "training_manifest" in contract:
+        from egomimic.robot.piper_pico.pi05_training_data import (
+            SCHEMA as MIXED_SCHEMA,
+        )
+        from egomimic.robot.piper_pico.pi05_training_data import (
+            deployment_manifest,
+            validate_training_manifest,
+        )
+
+        mixed = validate_training_manifest(contract["training_manifest"])
+        if mixed["schema"] != MIXED_SCHEMA or deployment_manifest(mixed) != manifest:
+            raise ValueError(
+                "Mixed checkpoint deployment manifest differs from Piper source"
+            )
+        domain_stats = contract.get("domain_stats", {})
+        if set(domain_stats) != {"piper", "ego"}:
+            raise ValueError("Mixed checkpoint requires both domain statistics")
+        for domain, filename in (
+            ("piper", "norm_stats.json"),
+            ("ego", "ego_norm_stats.json"),
+        ):
+            entry = domain_stats[domain]
+            if entry.get("filename") != filename or sha256(
+                root / filename
+            ) != entry.get("sha256"):
+                raise ValueError(f"Checkpoint {domain} statistics SHA256 mismatch")
+            validate_stats(read_json(root / filename))
+        if domain_stats["piper"]["sha256"] != contract.get("stats_sha256"):
+            raise ValueError(
+                "Mixed checkpoint Piper statistics disagree with deployment"
+            )
+    elif "domain_stats" in contract:
+        raise ValueError("Domain statistics require a mixed training manifest")
     for name, key in (
         ("norm_stats.json", "stats_sha256"),
         ("tokenizer.model", "tokenizer_sha256"),

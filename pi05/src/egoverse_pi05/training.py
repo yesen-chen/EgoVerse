@@ -59,11 +59,14 @@ def dry_run(cfg):
             or not np.asarray(observation.tokenized_prompt_mask).any(axis=-1).all()
         ):
             raise ValueError("Invalid action padding or empty tokenized task/state")
-        if not all(np.asarray(mask).all() for mask in observation.image_masks.values()):
-            raise ValueError("All three real camera inputs must be visible")
+        if not np.asarray(observation.image_masks["base_0_rgb"]).all():
+            raise ValueError("Every sample requires a real front camera input")
         return {
             "actions_shape": list(actions.shape),
             "images": {k: list(v.shape) for k, v in observation.images.items()},
+            "image_masks": {
+                k: np.asarray(v).tolist() for k, v in observation.image_masks.items()
+            },
         }
 
 
@@ -83,7 +86,7 @@ def run_training(
     from openpi.training import checkpoints
     from scripts import train
 
-    from egomimic.robot.piper_pico.pi05_data import load_manifest
+    from egomimic.robot.piper_pico.pi05_training_data import load_training_manifest
     from egoverse_pi05.config import local_dataset_loader
 
     devices = jax.devices()
@@ -94,7 +97,7 @@ def run_training(
     validate_device_topology(
         cfg.batch_size, cfg.fsdp_devices, len(devices), jax.process_count()
     )
-    manifest = load_manifest(manifest_path)
+    manifest = load_training_manifest(manifest_path)
     stats_path = Path(stats_dir) / "norm_stats.json"
     contract = build_contract(
         manifest=manifest,
