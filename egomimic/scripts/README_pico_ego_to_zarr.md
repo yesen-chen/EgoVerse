@@ -1,5 +1,10 @@
 # PICO ego recording → world-frame EgoVerse Zarr
 
+For the external UVC joint format (`ego.mp4`, `frames.csv`, `tracking.jsonl`),
+use [the joint-recording converter](README_pico_uvc_ego_to_zarr.md), which adds
+UI trimming, strict inactivity splitting and configurable future-window rules.
+The entry point below remains for the original PICO camera recordings.
+
 This converter is separate from `piper_pico_to_zarr.py` (real robot data). It
 reads XRoboToolkit JSONL tracking and a video, applies a supplied **frozen**
 fit, and exports one Zarr episode per continuous valid bimanual segment.

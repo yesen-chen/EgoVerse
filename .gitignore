@@ -54,3 +54,16 @@ external/MANO/
 build/
 dist/
 docs/
+
+# Local captures, fits, converted data, and checkpoints
+data/
+data.zip
+ckpt/
+diagnostics/
+recordings/
+converted_ego/
+piper_pico_*/
+camera_latency_uvc_*/
+calibrations/retired/
+calibrations/uvc_front_intrinsics_*/
+calibrations/uvc_front_lrcp_*

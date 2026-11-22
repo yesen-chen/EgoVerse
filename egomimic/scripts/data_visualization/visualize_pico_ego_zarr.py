@@ -21,6 +21,8 @@ import simplejpeg
 import zarr
 from scipy.spatial.transform import Rotation
 
+from egomimic.robot.piper_pico.image_geometry import validate_image_geometry
+
 SIDES = ("left", "right")
 CHAINS = (
     (0, 1),
@@ -136,6 +138,78 @@ def _read(group, name, n):
     return np.asarray(group[name][:n])
 
 
+def _rigid_transform(value, name):
+    transform = np.asarray(value, dtype=float)
+    if (
+        transform.shape != (4, 4)
+        or not np.isfinite(transform).all()
+        or not np.allclose(transform[3], [0, 0, 0, 1], atol=1e-8, rtol=0)
+        or not np.allclose(
+            transform[:3, :3].T @ transform[:3, :3], np.eye(3), atol=1e-6, rtol=0
+        )
+        or not np.isclose(np.linalg.det(transform[:3, :3]), 1, atol=1e-6, rtol=0)
+    ):
+        raise ValueError(f"{name} must be a finite proper rigid transform")
+    return transform
+
+
+def external_uvc_geometry(attrs, image_size):
+    """Verify processed pixels and recover T_C_H independently from the fit.
+
+    The frozen fit is the source of the extrinsic reference, not the converter's
+    derived camera_from_head field. Rectification has R=I, so the optical frame
+    stays unchanged; only the pixel camera matrix changes.
+    """
+    pico = attrs["pico_ego"]
+    fit = pico.get("fit", {}).get("data", {})
+    if fit.get("schema") != "seeded_external_uvc_spacetime_v1":
+        raise ValueError("External UVC data require the frozen external spacetime fit")
+    parameters = fit.get("parameters", {})
+    rotation = np.asarray(parameters.get("R_CH"), dtype=float)
+    translation = np.asarray(parameters.get("t_CH_m"), dtype=float)
+    if rotation.shape != (3, 3) or translation.shape != (3,):
+        raise ValueError("Frozen fit requires R_CH (3,3) and t_CH_m (3,)")
+    camera_from_head = np.eye(4)
+    camera_from_head[:3, :3] = rotation
+    camera_from_head[:3, 3] = translation
+    _rigid_transform(camera_from_head, "Frozen fit T_C_H")
+    saved = _rigid_transform(pico.get("camera_from_head"), "camera_from_head")
+    if not np.allclose(saved, camera_from_head, atol=1e-8, rtol=0):
+        raise ValueError("Saved camera_from_head differs from the frozen fit T_C_H")
+
+    geometry = attrs.get("image_geometry", {}).get("front_1")
+    validate_image_geometry(geometry)
+    if (
+        attrs.get("image_space") != "processed"
+        or geometry["operation"] != "undistort_resize"
+        or geometry["D_output"] != [0.0] * 5
+    ):
+        raise ValueError("External UVC JPEGs must be rectified processed images")
+    if list(image_size) != geometry["output_size"]:
+        raise ValueError("Saved JPEG size differs from image geometry output_size")
+    k = np.asarray(attrs["intrinsics"]["front_1"], dtype=float)
+    if k.shape == (3, 4) and np.all(k[:, 3] == 0):
+        k = k[:, :3]
+    if k.shape != (3, 3) or not np.allclose(k, geometry["K_output"], atol=1e-8, rtol=0):
+        raise ValueError("Saved front_1 intrinsics differ from processed K_output")
+    intrinsics = fit.get("intrinsics", {})
+    if intrinsics.get("mirror") is not False:
+        raise ValueError("External fit must explicitly declare mirror=false")
+    if intrinsics.get("image_size") != geometry["source_size"]:
+        raise ValueError("Frozen fit image_size differs from raw geometry size")
+    for raw_key, geometry_key in (("raw_K", "K_raw"), ("raw_D", "D_raw")):
+        raw = np.asarray(intrinsics.get(raw_key), dtype=float)
+        expected = np.asarray(geometry[geometry_key], dtype=float)
+        if raw.shape != expected.shape or not np.allclose(
+            raw, expected, atol=1e-8, rtol=0
+        ):
+            raise ValueError(f"Frozen fit {raw_key} differs from image geometry")
+    root_distortion = attrs.get("distortion_coefficients", {}).get("front_1")
+    if root_distortion is not None and root_distortion != [0.0] * 5:
+        raise ValueError("Processed front_1 must declare zero output distortion")
+    return camera_from_head, geometry
+
+
 def render_episode(episode: Path, output_root: Path, axis_length: float = 0.06) -> Path:
     """Write one preview and geometric verification report without changing input."""
     if not np.isfinite(axis_length) or axis_length <= 0:
@@ -157,10 +231,6 @@ def render_episode(episode: Path, output_root: Path, axis_length: float = 0.06) 
     raw_head_pose = _read(group, "source.head_pose", n)
     world_from_camera = pose_matrices(camera_pose)
     camera_from_world = np.linalg.inv(world_from_camera)
-    camera_from_head = np.asarray(attrs["pico_ego"]["camera_from_head"], dtype=float)
-    if camera_from_head.shape != (4, 4) or not np.isfinite(camera_from_head).all():
-        raise ValueError("pico_ego.camera_from_head must be finite (4,4)")
-    reference_chain = camera_from_head @ np.linalg.inv(pose_matrices(raw_head_pose))
     timestamps = _read(group, "timestamp_ns", n).astype(np.int64)
     grid = _read(group, "source.grid_timestamp_ns", n).astype(np.int64)
     rgb_timestamps = _read(group, "obs_rgb_timestamps_ns", n).astype(np.int64)
@@ -177,6 +247,26 @@ def render_episode(episode: Path, output_root: Path, axis_length: float = 0.06) 
     height, width = first_rgb.shape[:2]
     if width % 2 or height % 2:
         raise ValueError("Preview H.264 video requires even image dimensions")
+    source_format = attrs["pico_ego"].get("source_format", "legacy_pico")
+    geometry = None
+    if source_format == "uvc_joint_v1":
+        camera_from_head, geometry = external_uvc_geometry(attrs, [width, height])
+        reference_basis = "frozen external fit parameters R_CH and t_CH_m"
+    else:
+        camera_from_head = _rigid_transform(
+            attrs["pico_ego"]["camera_from_head"], "pico_ego.camera_from_head"
+        )
+        reference_basis = "saved legacy camera_from_head"
+    image_time_basis = (
+        "frame receive UTC" if source_format == "uvc_joint_v1" else "video PTS"
+    )
+    reference_chain = camera_from_head @ np.linalg.inv(pose_matrices(raw_head_pose))
+    matrix_error = float(np.max(np.abs(camera_from_world - reference_chain)))
+    if source_format == "uvc_joint_v1" and matrix_error > 1e-5:
+        raise ValueError(
+            "Saved optical camera poses disagree with frozen-fit/head chain "
+            f"(max matrix error {matrix_error:.3g})"
+        )
     source_frames = _read(group, "source.video_frame_index", n)
     uv, depth, axes_uv, filled, valid, grip, age, reference_error = (
         {},
@@ -275,13 +365,13 @@ def render_episode(episode: Path, output_root: Path, axis_length: float = 0.06) 
                 elapsed = (int(timestamps[i]) - int(timestamps[0])) / 1e9
                 _text(
                     image,
-                    f"left camera  {i}/{n - 1}  source={source_frames[i]}  grid t={elapsed:.3f}s",
+                    f"front_1  {i}/{n - 1}  source={source_frames[i]}  grid t={elapsed:.3f}s",
                     0,
                 )
                 image_delta_ms = (int(rgb_timestamps[i]) - int(timestamps[i])) / 1e6
                 _text(
                     image,
-                    f"grid pose -> nearest PTS image  dt={image_delta_ms:+.1f}ms | XYZ=RGB",
+                    f"grid -> nearest {image_time_basis}  dt={image_delta_ms:+.1f}ms | XYZ=RGB",
                     3,
                 )
                 frame = av.VideoFrame.from_ndarray(image, format="bgr24")
@@ -312,10 +402,12 @@ def render_episode(episode: Path, output_root: Path, axis_length: float = 0.06) 
             "total_frames": n,
             "image_size": [width, height],
             "duration_s": (int(timestamps[-1]) - int(timestamps[0])) / 1e9,
-            "video_time_basis": "regular sampling grid timestamps, first frame rebased to zero; nearest-PTS source images may repeat",
-            "camera_matrix_chain_max_abs_error": float(
-                np.max(np.abs(camera_from_world - reference_chain))
-            ),
+            "video_time_basis": f"regular sampling grid timestamps, first frame rebased to zero; source images chosen by nearest {image_time_basis} may repeat",
+            "image_selection_time_basis": image_time_basis,
+            "source_format": source_format,
+            "camera_reference_basis": reference_basis,
+            "camera_matrix_chain_max_abs_error": matrix_error,
+            "image_geometry": geometry,
             "grid_to_image_abs_dt_ms": _stats(
                 np.abs(rgb_timestamps - timestamps) / 1e6
             ),
@@ -323,7 +415,7 @@ def render_episode(episode: Path, output_root: Path, axis_length: float = 0.06) 
                 np.count_nonzero(np.diff(rgb_timestamps) == 0)
             ),
             "intrinsics": k.tolist(),
-            "interpretation": "Projection uses saved grid-time world joints, saved grid-time world optical-camera pose and nearest-PTS JPEGs. Grid-to-image phase difference is reported separately. Chain agreement checks conversion consistency only; visible overlay is not independent ground-truth synchronization or calibration accuracy. No MediaPipe and no refitting.",
+            "interpretation": f"Projection uses saved grid-time world joints, saved grid-time world optical-camera pose and JPEGs chosen by nearest {image_time_basis}. Grid-to-image phase difference is reported separately. Chain agreement checks conversion consistency only; visible overlay is not independent ground-truth synchronization or calibration accuracy. No MediaPipe and no refitting.",
             "hands": {},
         }
         for side in SIDES:
