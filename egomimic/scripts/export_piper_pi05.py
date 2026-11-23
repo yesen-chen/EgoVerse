@@ -25,6 +25,13 @@ def main(argv=None):
     parser.add_argument("--validation-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--prompt", help="Override each episode's task_description")
+    parser.add_argument(
+        "--state-history-offsets-ms",
+        type=float,
+        nargs="*",
+        default=[],
+        help="Negative offsets in milliseconds, oldest first; empty disables history",
+    )
     args = parser.parse_args(argv)
     try:
         if not args.input.is_dir():
@@ -43,6 +50,9 @@ def main(argv=None):
             validation_ratio=args.validation_ratio,
             seed=args.seed,
             prompt=args.prompt,
+            state_history_offsets_s=tuple(
+                x / 1000 for x in args.state_history_offsets_ms
+            ),
         )
     except (ValueError, FileNotFoundError, FileExistsError, KeyError) as exc:
         parser.exit(1, f"Pi0.5 export failed: {exc}\n")

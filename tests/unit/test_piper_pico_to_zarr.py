@@ -37,6 +37,69 @@ def test_piper_identity_is_distinct_and_preserves_original_ids():
     assert get_embodiment(7) == "PIPER_BIMANUAL"
 
 
+@pytest.mark.parametrize("offsets", [[], [-25], [-90, -47, -21]])
+def test_converter_cli_forwards_optional_history_offsets(
+    monkeypatch, tmp_path, offsets
+):
+    from egomimic.robot.piper_pico import pi05_data
+    from egomimic.scripts import piper_pico_to_zarr as converter
+
+    converted = [tmp_path / "episode.zarr"]
+    calls = []
+    monkeypatch.setattr(converter, "convert_dataset", lambda *a, **kw: converted)
+
+    def export(paths, output, **kwargs):
+        calls.append((paths, output, kwargs))
+        return output
+
+    monkeypatch.setattr(pi05_data, "export_manifest", export)
+    converter.main(
+        [
+            "--input",
+            str(tmp_path / "raw"),
+            "--output-dir",
+            str(tmp_path / "converted"),
+            "--pi05-manifest",
+            str(tmp_path / "manifest.json"),
+            *(
+                ["--pi05-state-history-offsets-ms", *map(str, offsets)]
+                if offsets
+                else []
+            ),
+        ]
+    )
+    assert calls[0][0] == converted
+    assert calls[0][2]["state_history_offsets_s"] == tuple(x / 1000 for x in offsets)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--pi05-state-history-offsets-ms", "-25"],
+        [
+            "--pi05-manifest",
+            "manifest.json",
+            "--pi05-state-history-offsets-ms",
+            "-25",
+            "-50",
+        ],
+        ["--pi05-manifest", "manifest.json", "--pi05-state-history-offsets-ms", "0"],
+    ],
+)
+def test_converter_cli_rejects_invalid_history_before_conversion(monkeypatch, extra):
+    from egomimic.scripts import piper_pico_to_zarr as converter
+
+    def unexpected(*args, **kwargs):
+        pytest.fail(
+            "Invalid history arguments must be rejected before conversion writes"
+        )
+
+    monkeypatch.setattr(converter, "convert_dataset", unexpected)
+    with pytest.raises(SystemExit) as exc:
+        converter.main(["--input", "raw", "--output-dir", "converted", *extra])
+    assert exc.value.code == 2
+
+
 def write_video(path, frames=8):
     with av.open(str(path), mode="w") as out:
         stream = out.add_stream("mpeg4", rate=40)
@@ -69,7 +132,8 @@ def write_ticks(data, tau):
         action[:, i * 7 + 5] = np.arange(n) * 0.3
         action[:, i * 7 + 6] = np.linspace(0.08, 0, n)
         data.create_array(
-            f"robot{i}_eef_pos", data=np.column_stack([tau - 1000 + i, tau * 0, tau * 0])
+            f"robot{i}_eef_pos",
+            data=np.column_stack([tau - 1000 + i, tau * 0, tau * 0]),
         )
         data.create_array(
             f"robot{i}_eef_rot_axis_angle",
@@ -214,6 +278,87 @@ def test_uncalibrated_requires_opt_in_and_never_invents_matrices(capture, tmp_pa
     assert "hardcoded" in attrs["requires_training_transform"]
 
 
+def _write_raw_feedback(capture):
+    times = TICKS[0] - 0.1 + np.arange(30) * 0.01
+    for index in range(2):
+        pose = np.zeros((len(times), 6))
+        pose[:, 0] = times - TICKS[0] + index
+        np.savez(
+            capture / f"videos/0/robot{index}_state.npz",
+            eef_pose=pose,
+            eef_pose__timestamp=times,
+            gripper_width=np.ones((len(times), 1)) * 0.04,
+            gripper_width__timestamp=times,
+        )
+
+
+def test_conversion_carries_portable_high_rate_feedback(capture, tmp_path):
+    from egomimic.robot.piper_pico.state_history import (
+        load_feedback_streams,
+        sample_state_history,
+    )
+
+    _write_raw_feedback(capture)
+    output = convert_dataset(
+        capture,
+        tmp_path / "export",
+        options=Options(allow_uncalibrated=True, width=16, height=12),
+    )[0]
+    feedback = load_feedback_streams(output)
+    assert len(feedback[0]["eef_pose"]) == 30  # Native rate retained, not six rows.
+    sampled = sample_state_history(
+        feedback, TICKS[0], [-0.025], available_until=[TICKS[0] - 0.004] * 2
+    )
+    np.testing.assert_allclose(sampled[0, [0, 7]], [-0.025, 0.975])
+    np.testing.assert_allclose(sampled[0, [6, 13]], 0.04)
+
+
+def test_backfill_preserves_all_existing_zarr_bytes_and_is_idempotent(
+    capture, tmp_path
+):
+    from egomimic.robot.piper_pico.state_history import (
+        load_feedback_streams,
+        portable_feedback_metadata,
+    )
+    from egomimic.scripts.backfill_piper_state_history import backfill_feedback_history
+
+    output = convert_dataset(
+        capture,
+        tmp_path / "export",
+        options=Options(allow_uncalibrated=True, width=16, height=12),
+    )[0]
+    assert portable_feedback_metadata(output)["status"] == "unavailable"
+    original = {
+        p.relative_to(output): p.read_bytes()
+        for p in output.rglob("*")
+        if p.is_file() and p.name != "feedback_history.json"
+    }
+    _write_raw_feedback(capture)
+    assert backfill_feedback_history(capture, output.parent) == [output]
+    descriptor_bytes = (output / "feedback_history.json").read_bytes()
+    assert backfill_feedback_history(capture, output.parent) == [output]
+    assert (output / "feedback_history.json").read_bytes() == descriptor_bytes
+    assert len(load_feedback_streams(output)[0]["eef_pose"]) == 30
+    for relative, contents in original.items():
+        assert (output / relative).read_bytes() == contents
+
+
+def test_backfill_rejects_wrong_recording_before_writing(capture, tmp_path):
+    from egomimic.scripts.backfill_piper_state_history import backfill_feedback_history
+
+    output = convert_dataset(
+        capture,
+        tmp_path / "export",
+        options=Options(allow_uncalibrated=True, width=16, height=12),
+    )[0]
+    _write_raw_feedback(capture)
+    group = zarr.open_group(str(capture / "replay_buffer.zarr"), mode="a")
+    group["data/robot0_eef_pos"][:] += 1
+    with pytest.raises(ValueError, match="measured pose"):
+        backfill_feedback_history(capture, output.parent)
+    assert not (output / "feedback_history").exists()
+
+
 def test_invalid_calibration_direction_and_rotation(tmp_path):
     path, data = calibration_file(tmp_path / "cal.json")
     data["extrinsics_convention"] = "T_camera_base"
@@ -344,7 +489,9 @@ def test_collector_tick_rows_convert_end_to_end(tmp_path):
     np.testing.assert_allclose(group["left.cmd_ee_pose"][:6, 0], np.arange(6))
     np.testing.assert_allclose(group["right.obs_ee_pose"][:6, 1], 1)
     np.testing.assert_array_equal(group["source.front_1.frame_index"][:6], SELECTED)
-    assert group.attrs["time_alignment"]["observation_to_send_s"] == pytest.approx(0.006)
+    assert group.attrs["time_alignment"]["observation_to_send_s"] == pytest.approx(
+        0.006
+    )
 
 
 def test_recording_without_tick_fields_is_refused(capture):

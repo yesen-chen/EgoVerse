@@ -20,6 +20,45 @@ CAMERAS = {
 }
 
 
+def history_offsets(contract):
+    """One validated history definition for data, training and serving."""
+    from egomimic.robot.piper_pico.state_history import validate_history_contract
+
+    return validate_history_contract(contract)
+
+
+def token_config(state_history=None, max_token_len=None):
+    enabled = bool(history_offsets(state_history))
+    length = positive_int(
+        (256 if enabled else 200) if max_token_len is None else max_token_len,
+        "max_token_len",
+    )
+    return {
+        "schema": "egoverse_pi05_token_input_v1",
+        "max_token_len": length,
+        "history_encoding": "discrete_state_oldest_first" if enabled else "none",
+        "history_normalization": "current_state_quantiles" if enabled else "none",
+        "overflow": "error" if enabled else "upstream_truncate",
+    }
+
+
+def validate_model_input(contract):
+    history = contract["manifest"].get("state_history")
+    offsets = history_offsets(history)
+    if contract.get("state_history") != history:
+        raise ValueError("Checkpoint state_history differs from its manifest")
+    # Existing checkpoints predate explicit token metadata and use OpenPI's 200.
+    model_input = contract.get("model_input")
+    if model_input is None:
+        if offsets:
+            raise ValueError("History checkpoint is missing its model_input contract")
+        return token_config()
+    length = contract.get("training", {}).get("max_token_len")
+    if length is None or model_input != token_config(history, length):
+        raise ValueError("Checkpoint model_input differs from its training contract")
+    return model_input
+
+
 def read_json(path):
     value = json.loads(Path(path).read_text())
     if not isinstance(value, dict):
@@ -135,6 +174,8 @@ def build_contract(*, manifest, stats_path, tokenizer_path, finetune_mode, train
     validate_stats(read_json(stats_path))
     if finetune_mode not in ("lora", "full"):
         raise ValueError("finetune_mode must be lora or full")
+    history = robot_manifest.get("state_history")
+    tokens = token_config(history, training.get("max_token_len"))
     result = {
         "schema": "egoverse_pi05_checkpoint_v1",
         "openpi_revision": OPENPI_REVISION,
@@ -148,7 +189,11 @@ def build_contract(*, manifest, stats_path, tokenizer_path, finetune_mode, train
         "tokenizer_sha256": sha256(tokenizer_path),
         "manifest": robot_manifest,
         "training": copy.deepcopy(training),
+        "model_input": tokens,
     }
+    result["training"]["max_token_len"] = tokens["max_token_len"]
+    if history is not None:
+        result["state_history"] = copy.deepcopy(history)
     if manifest["schema"] == MIXED_SCHEMA:
         load_training_stats(manifest, Path(stats_path).parent)
         result["training_manifest"] = copy.deepcopy(manifest)
@@ -186,7 +231,15 @@ def write_portable_assets(directory, contract, stats_path, tokenizer_path):
 
 
 def validate_resume_contract(saved, expected):
-    if saved != expected:
+    comparable = copy.deepcopy(expected)
+    # A legacy no-history run already used the same 200-token model. Adding
+    # explicit metadata must not prevent resuming that unchanged configuration.
+    if "model_input" not in saved and not saved.get("state_history"):
+        if comparable.get("model_input") == token_config():
+            comparable.pop("model_input")
+            if "max_token_len" not in saved.get("training", {}):
+                comparable["training"].pop("max_token_len", None)
+    if saved != comparable:
         raise ValueError(
             "Resume contract differs: data, normalization, model, timing, or optimizer configuration changed"
         )
@@ -246,6 +299,8 @@ def inference_summary(metadata):
                 "effective_span_s",
             )
         },
+        "state_history": copy.deepcopy(metadata.get("state_history")),
+        "max_token_len": metadata.get("model_input", token_config())["max_token_len"],
     }
 
 
@@ -278,6 +333,7 @@ def load_inference_assets(checkpoint_path, num_inference_steps=10):
     validate_checkpoint_mode(checkpoint / "params/_METADATA", mode)
     manifest = contract["manifest"]
     validate_manifest_contract(manifest)
+    model_input = validate_model_input(contract)
     if "training_manifest" in contract:
         from egomimic.robot.piper_pico.pi05_training_data import (
             SCHEMA as MIXED_SCHEMA,
@@ -339,7 +395,10 @@ def load_inference_assets(checkpoint_path, num_inference_steps=10):
         action_contract=copy.deepcopy(manifest["action_contract"]),
         training_contracts=copy.deepcopy(manifest["training_contracts"]),
         checkpoint=str(checkpoint),
+        model_input=copy.deepcopy(model_input),
     )
+    if manifest.get("state_history") is not None:
+        metadata["state_history"] = copy.deepcopy(manifest["state_history"])
     return InferenceAssets(
         checkpoint, root / "tokenizer.model", root / "norm_stats.json", metadata, stats
     )

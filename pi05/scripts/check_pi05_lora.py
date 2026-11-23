@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--openpi-root", type=Path)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-token-len", type=int)
     parser.add_argument(
         "--steps",
         type=int,
@@ -61,6 +62,7 @@ def main():
         save_interval=1,
         keep_period=1,
         resume=args.resume,
+        max_token_len=args.max_token_len,
     )
     # Both paths exercise genuine three-camera/task/state tokenization.
     print(json.dumps(dry_run(cfg), indent=2), flush=True)
@@ -84,6 +86,7 @@ def main():
         "padded_action_dim": 32,
         "camera_count": 3,
         "batch_size": args.batch_size,
+        "max_token_len": cfg.model.max_token_len,
         "total_parameters": count(shape_params),
         "trainable_parameters": count(trainable),
     }

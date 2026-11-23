@@ -56,6 +56,8 @@ class ObservationFrame:
     base_state: np.ndarray
     source_timestamps: Mapping[str, float]
     image_space: str = "raw"
+    base_state_history: np.ndarray | None = None
+    state_history_offsets_s: tuple[float, ...] = ()
 
     def validate(self):
         if self.image_space not in ("raw", "processed"):
@@ -63,6 +65,13 @@ class ObservationFrame:
         if not np.isfinite(self.timestamp):
             raise ValueError("observation timestamp must be finite")
         _finite(self.base_state, (14,), "base_state")
+        from egomimic.robot.piper_pico.state_history import validate_history_offsets
+
+        offsets = validate_history_offsets(self.state_history_offsets_s)
+        if offsets:
+            _finite(self.base_state_history, (len(offsets), 14), "base_state_history")
+        elif self.base_state_history is not None:
+            raise ValueError("base_state_history requires explicit history offsets")
         if set(self.images) != set(CAMERA_KEYS):
             raise ValueError("images must contain front_1, left_wrist, right_wrist")
         for name, image in self.images.items():
@@ -130,6 +139,12 @@ class ObservationFrame:
             base_state=np.asarray(state),
             source_timestamps=source_timestamps,
             image_space="raw",
+            base_state_history=(
+                np.array(obs["state_history_base"], dtype=np.float64, copy=True)
+                if "state_history_base" in obs
+                else None
+            ),
+            state_history_offsets_s=tuple(obs.get("state_history_offsets_s", ())),
         )
         frame.validate()
         return frame

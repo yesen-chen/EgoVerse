@@ -21,6 +21,14 @@ from scipy.spatial.transform import Rotation, Slerp
 
 from egomimic.rldb.action_timing import ActionTiming
 from egomimic.robot.piper_pico.image_geometry import validate_dataset_image_geometry
+from egomimic.robot.piper_pico.state_history import (
+    load_feedback_streams,
+    make_history_contract,
+    portable_feedback_metadata,
+    sample_state_history,
+    validate_history_contract,
+    validate_history_offsets,
+)
 
 SCHEMA = "egoverse_pi05_manifest_v1"
 CAMERAS = ("front_1", "left_wrist", "right_wrist")
@@ -57,6 +65,126 @@ def canonical_hash(value) -> str:
         json.dumps(
             value, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode()
+    ).hexdigest()
+
+
+def history_eligible_indices(streams, anchors, offsets_s, available_until=None):
+    """Vectorized strict coverage; the right interpolation endpoint must exist by now.
+
+    Streams have already been validated by the portable loader (or Ego episode
+    validator). This avoids repeatedly copying a full 100 Hz episode at export.
+    """
+    offsets = validate_history_offsets(offsets_s)
+    anchors = np.asarray(anchors, dtype=float)
+    eligible = np.ones(len(anchors), dtype=bool)
+    if offsets:
+        cutoffs = np.repeat(anchors[:, None], 2, axis=1)
+        if available_until is not None:
+            cutoffs = np.asarray(available_until, dtype=float)
+            if (
+                cutoffs.shape != (len(anchors), 2)
+                or not np.isfinite(cutoffs).all()
+                or np.any(cutoffs > anchors[:, None])
+            ):
+                raise ValueError(
+                    "history availability cutoffs must be finite and no later than observation"
+                )
+        for arm, stream in enumerate(streams):
+            for field in ("eef_pose", "gripper_width"):
+                stamps = np.asarray(stream[f"{field}__timestamp"], dtype=float)
+                available = np.searchsorted(stamps, cutoffs[:, arm], side="right") - 1
+                eligible &= available >= 0
+                latest = stamps[np.maximum(available, 0)]
+                eligible &= anchors + offsets[0] >= stamps[0]
+                eligible &= anchors + offsets[-1] <= latest
+    return np.flatnonzero(eligible).tolist()
+
+
+def history_to_camera(history, transforms, open_m):
+    """Feedback metres/rotvec -> model current-camera XYZ/YPR/normalized width."""
+    result = []
+    for arm, side in enumerate(SIDES):
+        values = np.asarray(history, dtype=float)[:, arm * 7 : (arm + 1) * 7]
+        rotation = Rotation.from_rotvec(values[:, 3:6])
+        poses = np.column_stack([values[:, :3], rotation.as_quat()[:, [3, 0, 1, 2]]])
+        xyz, camera_rotation = _camera_pose(poses, transforms[side])
+        result.append(
+            np.column_stack(
+                [
+                    xyz,
+                    camera_rotation.as_euler("ZYX"),
+                    values[:, 6] / open_m,
+                ]
+            )
+        )
+    return np.concatenate(result, axis=1).astype(np.float32)
+
+
+def _data_identity(records):
+    return canonical_hash(
+        [
+            {
+                key: record[key]
+                for key in (
+                    "metadata_sha256",
+                    "numeric_sha256",
+                    "total_frames",
+                    *(
+                        (
+                            "feedback_history_sha256",
+                            "feedback_available_until_sha256",
+                            "eligible_indices",
+                        )
+                        if "feedback_history_sha256" in record
+                        else ()
+                    ),
+                )
+            }
+            for record in records
+        ]
+    )
+
+
+def _validate_eligible_indices(record, *, upper=None):
+    indices = record.get("eligible_indices")
+    upper = record["total_frames"] if upper is None else upper
+    if (
+        not isinstance(indices, list)
+        or not indices
+        or any(
+            isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < upper
+            for i in indices
+        )
+        or any(a >= b for a, b in zip(indices, indices[1:]))
+    ):
+        raise ValueError("invalid state_history eligible indices")
+    return indices
+
+
+def _feedback_for_episode(path):
+    descriptor = portable_feedback_metadata(path)
+    if descriptor is None or descriptor.get("status") != "available":
+        raise ValueError(
+            f"{path}: state_history requires portable 100 Hz feedback sidecars"
+        )
+    streams = load_feedback_streams(path, descriptor)
+    store = zarr.open_group(str(path), mode="r")
+    count = store.attrs["total_frames"]
+    cutoffs = []
+    for side in SIDES:
+        key = f"source.{side}.robot_timestamp"
+        if key not in store:
+            raise ValueError(f"{path}: state_history requires recorded {key}")
+        values = np.asarray(store[key][:count], dtype=np.float64)
+        if values.shape != (count,) or not np.isfinite(values).all():
+            raise ValueError(f"{path}: invalid history availability cutoff {key}")
+        cutoffs.append(values)
+    return descriptor, streams, np.column_stack(cutoffs)
+
+
+def _cutoffs_hash(cutoffs):
+    return hashlib.sha256(
+        np.ascontiguousarray(cutoffs, dtype="<f8").tobytes()
     ).hexdigest()
 
 
@@ -237,6 +365,7 @@ def export_manifest(
     seed=42,
     prompt=None,
     allow_synthetic_calibration=False,
+    state_history_offsets_s=(),
 ) -> Path:
     """Write a portable reference manifest; never copy or re-encode source images.
 
@@ -245,6 +374,8 @@ def export_manifest(
     paths are relative to the manifest; moving their common ancestor is safe.
     """
     timing = ActionTiming(source_fps, source_horizon, action_stride, 100)
+    history_contract = make_history_contract(state_history_offsets_s)
+    history_offsets = validate_history_offsets(state_history_offsets_s)
     if not np.isfinite(validation_ratio) or not 0 <= validation_ratio < 1:
         raise ValueError("validation_ratio must be in [0,1)")
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
@@ -288,6 +419,23 @@ def export_manifest(
                 "prompt": text.strip(),
             }
         )
+        if history_offsets:
+            descriptor, streams, cutoffs = _feedback_for_episode(path)
+            eligible = history_eligible_indices(
+                streams, arrays["timestamp"], history_offsets, cutoffs
+            )
+            if not eligible:
+                raise ValueError(
+                    f"{path}: no sample has strict causal state_history coverage"
+                )
+            records[-1].update(
+                {
+                    "feedback_history": descriptor,
+                    "feedback_history_sha256": canonical_hash(descriptor),
+                    "feedback_available_until_sha256": _cutoffs_hash(cutoffs),
+                    "eligible_indices": eligible,
+                }
+            )
     if validation_ratio and len(records) < 2:
         raise ValueError(
             "a validation split requires at least two episodes; use ratio 0 for a smoke test"
@@ -315,17 +463,11 @@ def export_manifest(
         },
         "allow_synthetic_calibration": bool(allow_synthetic_calibration),
         "episodes": records,
-        "data_identity_sha256": canonical_hash(
-            [
-                {
-                    k: record[k]
-                    for k in ("metadata_sha256", "numeric_sha256", "total_frames")
-                }
-                for record in records
-            ]
-        ),
+        "data_identity_sha256": _data_identity(records),
         "identity_scope": "metadata_and_numeric_rows; JPEG bytes are referenced, not re-encoded or content-hashed",
     }
+    if history_contract is not None:
+        result["state_history"] = history_contract
     result["manifest_sha256"] = _manifest_hash(result)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("x", encoding="utf-8") as stream:
@@ -347,6 +489,7 @@ def validate_manifest(value) -> dict:
         raise ValueError("Pi0.5 manifest checksum mismatch")
     if value.get("action_contract") != ACTION_CONTRACT:
         raise ValueError("unsupported Pi0.5 action contract")
+    history_offsets = validate_history_contract(value.get("state_history"))
     raw = value.get("action_timing", {})
     timing = ActionTiming(
         **{
@@ -393,6 +536,19 @@ def validate_manifest(value) -> dict:
             raise ValueError("invalid episode total_frames")
         if record.get("image_shapes") != value.get("image_shapes"):
             raise ValueError("episode camera shapes disagree with training contract")
+        if history_offsets:
+            _validate_eligible_indices(record)
+            descriptor = record.get("feedback_history")
+            if (
+                not isinstance(descriptor, dict)
+                or descriptor.get("status") != "available"
+                or canonical_hash(descriptor) != record.get("feedback_history_sha256")
+                or not isinstance(record.get("feedback_available_until_sha256"), str)
+                or len(record["feedback_available_until_sha256"]) != 64
+            ):
+                raise ValueError("invalid portable state_history identity")
+        elif any(k in record for k in ("feedback_history", "eligible_indices")):
+            raise ValueError("episode history data requires state_history contract")
         if _training_contract(record["contract"]) not in value.get(
             "training_contracts", []
         ):
@@ -409,15 +565,7 @@ def validate_manifest(value) -> dict:
         for c in contracts
     ):
         raise ValueError("gripper encoding must match across training contracts")
-    identity = canonical_hash(
-        [
-            {
-                k: record[k]
-                for k in ("metadata_sha256", "numeric_sha256", "total_frames")
-            }
-            for record in episodes
-        ]
-    )
+    identity = _data_identity(episodes)
     if value.get("data_identity_sha256") != identity:
         raise ValueError("data identity checksum mismatch")
     return value
@@ -445,6 +593,10 @@ class Pi05Dataset:
             raise ValueError("split must be train, validation, or all")
         self.manifest_path = Path(manifest_path).resolve()
         self.manifest = load_manifest(self.manifest_path)
+        self.history_offsets = validate_history_contract(
+            self.manifest.get("state_history")
+        )
+        self.state_history_offsets_s = self.history_offsets
         raw = self.manifest["action_timing"]
         self.timing = ActionTiming(
             **{
@@ -464,7 +616,7 @@ class Pi05Dataset:
             for r in self.manifest["episodes"]
             if split == "all" or r["split"] == split
         ]
-        self._numeric, self._paths = [], []
+        self._numeric, self._paths, self._history = [], [], []
         for record in self.episodes:
             path = (self.manifest_path.parent / record["path"]).resolve()
             _, meta, arrays = _episode(
@@ -482,17 +634,68 @@ class Pi05Dataset:
                 raise ValueError(f"{path}: source contract changed")
             self._numeric.append(arrays)
             self._paths.append(path)
-        self._ends = np.cumsum([r["total_frames"] for r in self.episodes])
+            if self.history_offsets:
+                descriptor, streams, cutoffs = _feedback_for_episode(path)
+                if (
+                    descriptor != record["feedback_history"]
+                    or _cutoffs_hash(cutoffs)
+                    != record["feedback_available_until_sha256"]
+                    or history_eligible_indices(
+                        streams, arrays["timestamp"], self.history_offsets, cutoffs
+                    )
+                    != record["eligible_indices"]
+                ):
+                    raise ValueError(
+                        f"{path}: state_history source/coverage changed since export"
+                    )
+                self._history.append((streams, cutoffs))
+        self._ends = np.cumsum(
+            [
+                len(r["eligible_indices"])
+                if self.history_offsets
+                else r["total_frames"]
+                for r in self.episodes
+            ]
+        )
         self._stores = {}
 
     def __len__(self):
         return int(self._ends[-1]) if len(self._ends) else 0
 
-    def __getitem__(self, index):
+    def source_location(self, index):
+        """Map a dataset window to its episode and original observation row."""
         if not isinstance(index, (int, np.integer)) or not 0 <= index < len(self):
             raise IndexError(index)
         episode = int(np.searchsorted(self._ends, index, side="right"))
         local = int(index - (self._ends[episode - 1] if episode else 0))
+        if self.history_offsets:
+            local = self.episodes[episode]["eligible_indices"][local]
+        return episode, local
+
+    def index_for_source(self, episode, local):
+        """Return a window index; missing-history rows are explicitly ineligible."""
+        if not isinstance(episode, (int, np.integer)) or not 0 <= episode < len(
+            self.episodes
+        ):
+            raise IndexError((episode, local))
+        if (
+            not isinstance(local, (int, np.integer))
+            or not 0 <= local < self.episodes[episode]["total_frames"]
+        ):
+            raise IndexError((episode, local))
+        offset = int(self._ends[episode - 1]) if episode else 0
+        if not self.history_offsets:
+            return offset + int(local)
+        indices = self.episodes[episode]["eligible_indices"]
+        position = int(np.searchsorted(indices, local))
+        if position >= len(indices) or indices[position] != local:
+            raise IndexError(
+                f"episode {episode} row {local} has no eligible state_history"
+            )
+        return offset + position
+
+    def __getitem__(self, index):
+        episode, local = self.source_location(index)
         record, arrays = self.episodes[episode], self._numeric[episode]
         indices = np.minimum(
             local + np.asarray(self.timing.support_indices), record["total_frames"] - 1
@@ -531,6 +734,19 @@ class Pi05Dataset:
             "actions": np.concatenate(actions, axis=1).astype(np.float32),
             "prompt": record["prompt"],
         }
+        if self.history_offsets:
+            streams, cutoffs = self._history[episode]
+            history = sample_state_history(
+                streams,
+                arrays["timestamp"][local],
+                self.history_offsets,
+                available_until=cutoffs[local],
+            )
+            result["observation.state_history"] = history_to_camera(
+                history,
+                record["contract"]["extrinsics"],
+                record["contract"]["gripper_encoding"]["open_m"],
+            )
         if self.include_images:
             if episode not in self._stores:
                 self._stores[episode] = zarr.open_group(

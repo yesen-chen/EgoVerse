@@ -104,7 +104,7 @@ def run_training(
         stats_path=stats_path,
         tokenizer_path=tokenizer_path,
         finetune_mode=finetune_mode,
-        training=training_contract,
+        training={**training_contract, "max_token_len": cfg.model.max_token_len},
     )
     record_path = Path(cfg.checkpoint_dir).parent / f"{cfg.exp_name}.run.json"
     if cfg.resume:

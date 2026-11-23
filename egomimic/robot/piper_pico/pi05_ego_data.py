@@ -22,7 +22,20 @@ from scipy.spatial.transform import Rotation, Slerp
 from egomimic.rldb.action_timing import ActionTiming
 from egomimic.rldb.ego_boundary_policy import EgoBoundaryPolicy
 from egomimic.robot.piper_pico.image_geometry import validate_image_geometry
-from egomimic.robot.piper_pico.pi05_data import _camera_pose, canonical_hash
+from egomimic.robot.piper_pico.pi05_data import (
+    _camera_pose,
+    _validate_eligible_indices,
+    canonical_hash,
+    history_eligible_indices,
+    history_to_camera,
+)
+from egomimic.robot.piper_pico.state_history import (
+    make_history_contract,
+    prepare_feedback_streams,
+    sample_state_history,
+    validate_history_contract,
+    validate_history_offsets,
+)
 
 SCHEMA = "egoverse_pi05_ego_manifest_v1"
 SIDES = ("left", "right")
@@ -293,11 +306,33 @@ def _identity(records):
                     "total_frames",
                     "eligible_starts",
                     "source_recording_sha256",
+                    *(("eligible_indices",) if "eligible_indices" in r else ()),
                 )
             }
             for r in records
         ]
     )
+
+
+def _ego_history_streams(arrays):
+    """History stays in world coordinates until the current camera is selected."""
+    streams = []
+    for side in SIDES:
+        poses = arrays[f"{side}.obs_ee_pose"]
+        streams.append(
+            {
+                "eef_pose": np.column_stack(
+                    [
+                        poses[:, :3],
+                        Rotation.from_quat(poses[:, [4, 5, 6, 3]]).as_rotvec(),
+                    ]
+                ),
+                "eef_pose__timestamp": arrays["timestamp"],
+                "gripper_width": arrays[f"{side}.obs_gripper_width_m"],
+                "gripper_width__timestamp": arrays["timestamp"],
+            }
+        )
+    return prepare_feedback_streams(streams)
 
 
 def export_ego_manifest(
@@ -313,9 +348,12 @@ def export_ego_manifest(
     gripper_mode="zero",
     require_full_window_after_trim=True,
     require_full_window_after_inactivity=True,
+    state_history_offsets_s=(),
 ):
     """Export references only; split entire source recordings before training."""
     timing = ActionTiming(source_fps, source_horizon, action_stride, 100)
+    history_contract = make_history_contract(state_history_offsets_s)
+    history_offsets = validate_history_offsets(state_history_offsets_s)
     policy = EgoBoundaryPolicy(
         require_full_window_after_trim, require_full_window_after_inactivity
     )
@@ -378,6 +416,18 @@ def export_ego_manifest(
                 "prompt": text.strip(),
             }
         )
+        if history_offsets:
+            eligible_indices = history_eligible_indices(
+                _ego_history_streams(arrays),
+                arrays["timestamp"][:eligible],
+                history_offsets,
+            )
+            if not eligible_indices:
+                raise ValueError(
+                    f"{path}: no sample has strict causal state_history coverage"
+                )
+            records[-1]["eligible_indices"] = eligible_indices
+            records[-1]["eligible_starts"] = len(eligible_indices)
     groups = sorted({r["source_recording_sha256"] for r in records})
     if validation_ratio and len(groups) < 2:
         raise ValueError(
@@ -415,6 +465,8 @@ def export_ego_manifest(
         "identity_scope": "metadata_and_numeric_rows; JPEG bytes are referenced, not re-encoded or content-hashed",
         "source_time_policy": "preserve stored timestamps; no physical slowdown or delay correction in adapter",
     }
+    if history_contract is not None:
+        result["state_history"] = history_contract
     result["manifest_sha256"] = _manifest_hash(result)
     validate_ego_manifest(result)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -431,6 +483,7 @@ def validate_ego_manifest(value):
         raise ValueError("Ego Pi0.5 manifest checksum mismatch")
     if value.get("action_contract") != ACTION_CONTRACT:
         raise ValueError("unsupported Ego Pi0.5 action contract")
+    history_offsets = validate_history_contract(value.get("state_history"))
     timing, policy = _timing(value), _policy(value)
     _mode(value.get("gripper_mode"))
     episodes = value.get("episodes")
@@ -495,8 +548,16 @@ def validate_ego_manifest(value):
             not _positive_int(count)
             or not _positive_int(eligible)
             or record.get("requires_full_window") is not required
-            or eligible != (count - timing.source_horizon + 1 if required else count)
         ):
+            raise ValueError(
+                "Ego eligible starts disagree with source horizon/boundary policy"
+            )
+        future_starts = count - timing.source_horizon + 1 if required else count
+        if history_offsets:
+            indices = _validate_eligible_indices(record, upper=future_starts)
+            if eligible != len(indices):
+                raise ValueError("Ego history eligible starts disagree with indices")
+        elif eligible != future_starts or "eligible_indices" in record:
             raise ValueError(
                 "Ego eligible starts disagree with source horizon/boundary policy"
             )
@@ -528,6 +589,9 @@ class EgoPi05Dataset:
             raise ValueError("split must be train, validation, or all")
         self.manifest_path = Path(manifest_path).resolve()
         self.manifest = load_ego_manifest(self.manifest_path)
+        self.history_offsets = validate_history_contract(
+            self.manifest.get("state_history")
+        )
         self.timing = _timing(self.manifest)
         self.boundary_policy = _policy(self.manifest)
         self.gripper_mode = self.manifest["gripper_mode"]
@@ -537,7 +601,7 @@ class EgoPi05Dataset:
             for r in self.manifest["episodes"]
             if split == "all" or r["split"] == split
         ]
-        self._numeric, self._paths, self._stores = [], [], {}
+        self._numeric, self._paths, self._stores, self._history = [], [], {}, []
         for record in self.episodes:
             path = (self.manifest_path.parent / record["path"]).resolve()
             meta, arrays = _episode(path, self.timing)
@@ -558,6 +622,23 @@ class EgoPi05Dataset:
                 raise ValueError(f"{path}: source contract changed")
             self._paths.append(path)
             self._numeric.append(arrays)
+            if self.history_offsets:
+                streams = _ego_history_streams(arrays)
+                future_starts = (
+                    record["total_frames"] - self.timing.source_horizon + 1
+                    if required
+                    else record["total_frames"]
+                )
+                if (
+                    history_eligible_indices(
+                        streams,
+                        arrays["timestamp"][:future_starts],
+                        self.history_offsets,
+                    )
+                    != record["eligible_indices"]
+                ):
+                    raise ValueError(f"{path}: state_history source coverage changed")
+                self._history.append(streams)
         self._ends = np.cumsum([r["eligible_starts"] for r in self.episodes])
 
     def __len__(self):
@@ -573,6 +654,8 @@ class EgoPi05Dataset:
         episode = int(np.searchsorted(self._ends, index, side="right"))
         local = int(index - (self._ends[episode - 1] if episode else 0))
         record, arrays = self.episodes[episode], self._numeric[episode]
+        if self.history_offsets:
+            local = record["eligible_indices"][local]
         indices = np.minimum(
             local + np.asarray(self.timing.support_indices), record["total_frames"] - 1
         )
@@ -619,6 +702,17 @@ class EgoPi05Dataset:
             "domain": "ego",
             "gripper_mode": self.gripper_mode,
         }
+        if self.history_offsets:
+            history = sample_state_history(
+                self._history[episode], arrays["timestamp"][local], self.history_offsets
+            )
+            result["observation.state_history"] = history_to_camera(
+                history,
+                {side: transform for side in SIDES},
+                record["contract"]["gripper_encoding"]["open_m"],
+            )
+            if self.gripper_mode == "zero":
+                result["observation.state_history"][:, [6, 13]] = 0
         if self.include_images:
             if episode not in self._stores:
                 self._stores[episode] = zarr.open_group(

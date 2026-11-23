@@ -16,7 +16,9 @@ from openpi.training import config, data_loader, optimizer, weight_loaders
 
 from egoverse_pi05.assets import (
     CAMERAS,
+    history_offsets,
     positive_int,
+    token_config,
     validate_manifest_contract,
     validate_stats,
 )
@@ -26,6 +28,7 @@ from egoverse_pi05.assets import (
 class BimanualInputs(transforms.DataTransformFn):
     # Serving stays strict: only the explicitly mixed training path accepts Ego.
     allow_ego: bool = False
+    state_history: dict | None = None
 
     def __call__(self, data):
         domain = data.get("domain", "piper")
@@ -65,6 +68,17 @@ class BimanualInputs(transforms.DataTransformFn):
             "image": images,
             "image_mask": image_mask,
         }
+        offsets = history_offsets(self.state_history)
+        history = data.get("observation.state_history")
+        if offsets:
+            history = np.asarray(history, dtype=np.float32)
+            if history.shape != (len(offsets), 14) or not np.isfinite(history).all():
+                raise ValueError(
+                    f"Expected {len(offsets)} x 14 finite state_history values"
+                )
+            result["state_history"] = history
+        elif "observation.state_history" in data:
+            raise ValueError("state_history is not enabled in this checkpoint")
         if self.allow_ego:
             result.update(domain=domain, gripper_mode=gripper_mode)
         if "actions" in data:
@@ -101,12 +115,17 @@ class DomainNormalize(transforms.DataTransformFn):
         for domain, wrapped in self.domain_stats.items():
             stats = validate_stats(wrapped)
             normalizers[domain] = transforms.Normalize(
-                {
-                    key: normalize.NormStats(
-                        **{field: np.asarray(value) for field, value in fields.items()}
-                    )
-                    for key, fields in stats.items()
-                },
+                with_history_stats(
+                    {
+                        key: normalize.NormStats(
+                            **{
+                                field: np.asarray(value)
+                                for field, value in fields.items()
+                            }
+                        )
+                        for key, fields in stats.items()
+                    }
+                ),
                 use_quantiles=True,
             )
         object.__setattr__(self, "_normalizers", normalizers)
@@ -120,9 +139,14 @@ class DomainNormalize(transforms.DataTransformFn):
         if domain == "piper" and gripper_mode != "width":
             raise ValueError("Piper requires physical gripper-width supervision")
         result = self._normalizers[domain](result)
-        for key in ("state", "actions"):
+        with_history = "state_history" in result
+        for key in ("state", "actions", "state_history"):
             if key in result:
-                result[key] = np.array(result[key], dtype=np.float32, copy=True)
+                # History-enabled training must tokenize the same precision as
+                # serving. Rounding only this mixed-data path can change a bin
+                # at a boundary. Keep legacy no-history preprocessing intact.
+                dtype = None if with_history and key != "actions" else np.float32
+                result[key] = np.array(result[key], dtype=dtype, copy=True)
                 if domain == "ego" and gripper_mode == "zero":
                     result[key][..., [6, 13]] = 0.0
         return result
@@ -141,12 +165,81 @@ class LocalTokenizer(tokenizer.PaligemmaTokenizer):
             raise FileNotFoundError(f"Local tokenizer is required: {path}")
         self._tokenizer = sentencepiece.SentencePieceProcessor(model_file=str(path))
 
+    def tokenize(self, prompt, state=None, *, state_history=None):
+        # Legacy checkpoints retain upstream tokens, dtypes and overflow
+        # behavior. Strict history budgeting applies only to the new input.
+        if state_history is None:
+            return super().tokenize(prompt, state)
+        text = prompt.strip().replace("_", " ").replace("\n", " ")
+        if state is None:
+            tokens = self._tokenizer.encode(
+                text, add_bos=True
+            ) + self._tokenizer.encode("\n")
+        else:
 
-def model_transforms(tokenizer_path, model_config):
+            def discretize(value):
+                bins = np.digitize(value, bins=np.linspace(-1, 1, 257)[:-1]) - 1
+                return " ".join(map(str, bins))
+
+            text = f"Task: {text}, State: {discretize(state)};"
+            if state_history is not None:
+                text += (
+                    " History (oldest first): "
+                    + "; ".join(discretize(row) for row in state_history)
+                    + ";"
+                )
+            tokens = self._tokenizer.encode(text + "\nAction: ", add_bos=True)
+        if len(tokens) > self._max_len:
+            raise ValueError(
+                f"Pi0.5 prompt/state/history needs {len(tokens)} tokens, exceeding "
+                f"max_token_len={self._max_len}; increase --max-token-len and retrain. "
+                "Refusing to truncate state history or the action prompt."
+            )
+        count = len(tokens)
+        return (
+            np.asarray(tokens + [0] * (self._max_len - count), dtype=np.int32),
+            np.arange(self._max_len) < count,
+        )
+
+
+def with_history_stats(stats, enabled=True):
+    result = dict(stats)
+    if enabled:
+        result["state_history"] = result["state"]
+    return result
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeStateHistory(transforms.DataTransformFn):
+    tokenizer: LocalTokenizer
+    count: int
+
+    def __call__(self, data):
+        result = dict(data)
+        # Preserve the normalizer's dtype just like the current state. Casting
+        # only history could move a value across a discrete tokenizer bin edge.
+        history = np.asarray(result.pop("state_history"))
+        if history.shape != (self.count, 14) or not np.isfinite(history).all():
+            raise ValueError("Invalid normalized state_history")
+        prompt = result.pop("prompt")
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+        tokens, masks = self.tokenizer.tokenize(
+            prompt, result["state"], state_history=history
+        )
+        # History is consumed here: OpenPI Observation has no history field.
+        return {**result, "tokenized_prompt": tokens, "tokenized_prompt_mask": masks}
+
+
+def model_transforms(tokenizer_path, model_config, state_history=None):
+    offsets = history_offsets(state_history)
+    local_tokenizer = LocalTokenizer(tokenizer_path, model_config.max_token_len)
     return [
         transforms.ResizeImages(224, 224),
-        transforms.TokenizePrompt(
-            LocalTokenizer(tokenizer_path, model_config.max_token_len),
+        TokenizeStateHistory(local_tokenizer, len(offsets))
+        if offsets
+        else transforms.TokenizePrompt(
+            local_tokenizer,
             discrete_state_input=True,
         ),
         transforms.PadStatesAndActions(model_config.action_dim),
@@ -173,12 +266,16 @@ class EgoVerseDataFactory(config.DataConfigFactory):
         manifest = load_training_manifest(self.manifest_path)
         domain_stats = load_training_stats(manifest, self.stats_dir)
         mixed = manifest["schema"] != "egoverse_pi05_manifest_v1"
+        history = manifest.get("state_history")
         if not mixed:
             validate_manifest_contract(manifest)
         inputs = (
-            [BimanualInputs(allow_ego=True), DomainNormalize(domain_stats)]
+            [
+                BimanualInputs(allow_ego=True, state_history=history),
+                DomainNormalize(domain_stats),
+            ]
             if mixed
-            else [BimanualInputs()]
+            else [BimanualInputs(state_history=history)]
         )
         return EgoVerseDataConfig(
             repo_id="local/egoverse_piper_ego" if mixed else "local/egoverse_piper",
@@ -186,14 +283,18 @@ class EgoVerseDataFactory(config.DataConfigFactory):
             manifest_path=str(self.manifest_path),
             # OpenPI adds Normalize after data_transforms. Mixed inputs have
             # already used their own domain stats, so that stage must be a no-op.
-            norm_stats={} if mixed else normalize.load(self.stats_dir),
+            norm_stats={}
+            if mixed
+            else with_history_stats(
+                normalize.load(self.stats_dir), bool(history_offsets(history))
+            ),
             use_quantile_norm=True,
             action_sequence_keys=("actions",),
             data_transforms=transforms.Group(
                 inputs=inputs, outputs=[BimanualOutputs()]
             ),
             model_transforms=transforms.Group(
-                inputs=model_transforms(self.tokenizer_path, model_config)
+                inputs=model_transforms(self.tokenizer_path, model_config, history)
             ),
         )
 
@@ -218,7 +319,7 @@ def local_dataset_loader():
         yield
 
 
-def make_model_config(finetune_mode):
+def make_model_config(finetune_mode, *, state_history=None, max_token_len=None):
     if finetune_mode not in ("lora", "full"):
         raise ValueError("finetune_mode must be lora or full")
     suffix = "_lora" if finetune_mode == "lora" else ""
@@ -226,6 +327,7 @@ def make_model_config(finetune_mode):
         pi05=True,
         action_horizon=100,
         action_dim=32,
+        max_token_len=token_config(state_history, max_token_len)["max_token_len"],
         paligemma_variant=f"gemma_2b{suffix}",
         action_expert_variant=f"gemma_300m{suffix}",
     )
@@ -253,6 +355,7 @@ def make_train_config(
     finetune_mode="lora",
     fsdp_devices=1,
     keep_period=None,
+    max_token_len=None,
 ):
     for name, value in (
         ("batch_size", batch_size),
@@ -274,7 +377,14 @@ def make_train_config(
         positive_int(keep_period, "keep_period") % save_interval
     ):
         raise ValueError("keep_period must be a multiple of save_interval")
-    model = make_model_config(finetune_mode)
+    from egomimic.robot.piper_pico.pi05_training_data import load_training_manifest
+
+    manifest = load_training_manifest(manifest_path)
+    model = make_model_config(
+        finetune_mode,
+        state_history=manifest.get("state_history"),
+        max_token_len=max_token_len,
+    )
     freeze = (
         nnx.Any(model.get_freeze_filter(), PathRegex("PaliGemma/img/.*"))
         if finetune_mode == "lora"

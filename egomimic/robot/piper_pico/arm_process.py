@@ -285,9 +285,12 @@ class PiperArmProcess:
         simulate: bool = False,
         enable_motion: bool = True,
         preserve_gripper_on_enable: bool = False,
+        feedback_history_s: float = 1.28,
     ):
         import multiprocessing as mp
 
+        if not np.isfinite(feedback_history_s) or feedback_history_s <= 0:
+            raise ValueError("feedback_history_s must be finite and positive")
         context = mp.get_context("spawn")
         self.name = name
         self.can_port = can_port
@@ -297,7 +300,7 @@ class PiperArmProcess:
         self.ring = SharedMemoryRingBuffer.create_from_examples(
             shm_manager,
             state_examples(),
-            get_max_k=128,
+            get_max_k=max(128, int(np.ceil(feedback_history_s * frequency))),
             get_time_budget=0.01,
             put_desired_frequency=frequency,
         )

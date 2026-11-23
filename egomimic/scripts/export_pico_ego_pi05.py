@@ -27,6 +27,13 @@ def main(argv=None):
     parser.add_argument("--prompt", help="Override each episode's task_description")
     parser.add_argument("--gripper-mode", choices=("zero", "width"), default="zero")
     parser.add_argument(
+        "--state-history-offsets-ms",
+        type=float,
+        nargs="*",
+        default=[],
+        help="Negative offsets in milliseconds, oldest first; empty disables history",
+    )
+    parser.add_argument(
         "--allow-repeat-after-trim",
         action="store_true",
         help="Opt in to repeated terminal supervision after UI trimming",
@@ -55,6 +62,9 @@ def main(argv=None):
             seed=args.seed,
             prompt=args.prompt,
             gripper_mode=args.gripper_mode,
+            state_history_offsets_s=tuple(
+                x / 1000 for x in args.state_history_offsets_ms
+            ),
             require_full_window_after_trim=not args.allow_repeat_after_trim,
             require_full_window_after_inactivity=not args.allow_repeat_after_inactivity,
         )

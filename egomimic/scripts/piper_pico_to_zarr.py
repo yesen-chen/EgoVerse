@@ -36,6 +36,10 @@ from egomimic.robot.piper_pico.image_geometry import (
     RgbImageProcessor,
     camera_image_geometry,
 )
+from egomimic.robot.piper_pico.state_history import (
+    validate_history_offsets,
+    write_feedback_sidecar,
+)
 
 EXPECTED_CAMERAS = {"front_1", "left_wrist", "right_wrist"}
 SIDES = ("left", "right")
@@ -621,6 +625,9 @@ def convert_dataset(
                 pre_encoded_image_data=images,
                 metadata_override=metadata,
             )
+            # Portable high-rate feedback is independent of the row/image schema.
+            # Select history offsets at training time, without re-encoding images.
+            write_feedback_sidecar(video_dir, temporary)
             (temporary / "conversion_report.json").write_text(
                 json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False)
                 + "\n",
@@ -709,7 +716,22 @@ def main(argv=None):
     parser.add_argument(
         "--pi05-prompt", help="Override recorded task description for Pi0.5"
     )
+    parser.add_argument(
+        "--pi05-state-history-offsets-ms",
+        type=float,
+        nargs="*",
+        default=[],
+        help="Optional negative feedback history offsets in milliseconds, oldest first; requires --pi05-manifest",
+    )
     args = parser.parse_args(argv)
+    try:
+        history_offsets = validate_history_offsets(
+            [value / 1000 for value in args.pi05_state_history_offsets_ms]
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if history_offsets and args.pi05_manifest is None:
+        parser.error("--pi05-state-history-offsets-ms requires --pi05-manifest")
     options = Options(
         **{name: getattr(args, name) for name in Options.__dataclass_fields__}
     )
@@ -734,6 +756,7 @@ def main(argv=None):
                 validation_ratio=args.pi05_validation_ratio,
                 seed=args.pi05_split_seed,
                 prompt=args.pi05_prompt,
+                state_history_offsets_s=history_offsets,
             )
             print(
                 f"Pi0.5 manifest: {manifest}; 100-point windows are interpolated at training read time"

@@ -59,6 +59,9 @@ def validate_training_manifest(value):
         if not isinstance(path, str) or not path or Path(path).is_absolute():
             raise ValueError("Child manifest path must be relative")
         _child_validator(domain)(source["manifest"])
+    histories = [value["sources"][d]["manifest"].get("state_history") for d in DOMAINS]
+    if histories[0] != histories[1] or value.get("state_history") != histories[0]:
+        raise ValueError("Mixed domains must have identical state_history contracts")
     sampling = value.get("sampling", {})
     if sampling.get("method") != "weighted_complete_domain_cycles":
         raise ValueError("Unsupported mixed sampling method")
@@ -130,6 +133,9 @@ def export_mixed_manifest(
             }
         ),
     }
+    history = sources["piper"]["manifest"].get("state_history")
+    if history is not None:
+        value["state_history"] = copy.deepcopy(history)
     value["manifest_sha256"] = piper._manifest_hash(value)
     validate_training_manifest(value)
     destination.parent.mkdir(parents=True, exist_ok=True)

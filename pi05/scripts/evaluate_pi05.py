@@ -60,7 +60,6 @@ def main():
         for line in (args.reference_eval / "samples.jsonl").read_text().splitlines()
     ]
     paths = {path.resolve(): i for i, path in enumerate(dataset._paths)}
-    starts = np.r_[0, dataset._ends[:-1]]
     adapters = {}
     for i, path in enumerate(dataset._paths):
         metadata = dict(zarr.open_group(str(path), mode="r").attrs)
@@ -92,7 +91,7 @@ def main():
                 sample=row["sample"],
                 episode=episode,
                 frame_index=index,
-                dataset_index=int(starts[episode] + index),
+                dataset_index=dataset.index_for_source(episode, index),
                 static=static,
             )
         )

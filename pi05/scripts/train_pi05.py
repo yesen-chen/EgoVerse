@@ -21,6 +21,11 @@ def parse_args():
     parser.add_argument("--finetune-mode", choices=("lora", "full"), default="lora")
     parser.add_argument("--fsdp-devices", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--max-token-len",
+        type=int,
+        help="Task/current-state/history token budget (default 200, or 256 with history); overflow fails",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--decay-steps", type=int, default=1000)
@@ -65,6 +70,7 @@ def main():
         keep_period=args.keep_period,
         resume=args.resume,
         seed=args.seed,
+        max_token_len=args.max_token_len,
     )
     cfg = make_train_config(**config_values)
     if args.dry_run:

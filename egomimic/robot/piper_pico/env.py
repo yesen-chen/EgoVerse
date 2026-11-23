@@ -58,7 +58,14 @@ class PiperPicoEnv:
         enable_pico: bool = True,
         enable_motion: bool = True,
         preserve_gripper_on_enable: bool = False,
+        state_history_offsets_s=(),
     ):
+        from egomimic.robot.piper_pico.state_history import validate_history_offsets
+
+        self.state_history_offsets_s = validate_history_offsets(state_history_offsets_s)
+        feedback_history_s = max(
+            1.28, -min(self.state_history_offsets_s, default=0.0) + 0.25
+        )
         if cameras is None:
             cameras = []
         self.simulate = bool(simulate)
@@ -158,6 +165,7 @@ class PiperPicoEnv:
                 simulate=self.simulate,
                 enable_motion=self.enable_motion,
                 preserve_gripper_on_enable=self.preserve_gripper_on_enable,
+                feedback_history_s=feedback_history_s,
             ),
             PiperArmProcess(
                 shm_manager,
@@ -168,6 +176,7 @@ class PiperPicoEnv:
                 simulate=self.simulate,
                 enable_motion=self.enable_motion,
                 preserve_gripper_on_enable=self.preserve_gripper_on_enable,
+                feedback_history_s=feedback_history_s,
             ),
         ]
         self.pico = PicoProcess(shm_manager) if self.enable_pico else None
@@ -297,6 +306,30 @@ class PiperPicoEnv:
             query_time=query_time,
             robot_joint_positions=[data["joint_pos"] for data in robot_data],
         )
+        history_offsets = getattr(self, "state_history_offsets_s", ())
+        if history_offsets:
+            from egomimic.robot.piper_pico.state_history import sample_state_history
+
+            # The same SHM snapshots feed both current state and history. Do not
+            # reuse previous model requests, or read a later feedback snapshot.
+            streams = [
+                {
+                    "eef_pose": pose,
+                    "eef_pose__timestamp": data["robot_timestamp"],
+                    "gripper_width": data["gripper_position"],
+                    "gripper_width__timestamp": data["robot_timestamp"],
+                }
+                for data, pose in zip(robot_data, poses, strict=True)
+            ]
+            obs["state_history_base"] = sample_state_history(
+                streams,
+                query_time,
+                history_offsets,
+                available_until=[
+                    float(data["robot_timestamp"][-1]) for data in robot_data
+                ],
+            )
+            obs["state_history_offsets_s"] = np.asarray(history_offsets)
         # Preserve the collector's host-time alignment. Inference additionally
         # checks SDK receive stamps, which do not advance on a stale CAN cache.
         for index, data in enumerate(robot_data):

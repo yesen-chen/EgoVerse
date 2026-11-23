@@ -48,14 +48,35 @@ class RecordedObservationProvider:
     """
 
     def __init__(
-        self, episode, clock, *, start_frame=0, allow_synthetic_calibration=False
+        self,
+        episode,
+        clock,
+        *,
+        start_frame=0,
+        allow_synthetic_calibration=False,
+        state_history_offsets_s=(),
     ):
+        from egomimic.robot.piper_pico.state_history import (
+            load_feedback_streams,
+            validate_history_offsets,
+        )
+
+        self.state_history_offsets_s = validate_history_offsets(state_history_offsets_s)
         self.path = _local_path(episode, directory=True)
         self.metadata = preflight_piper_episode(
             self.path,
             allow_synthetic_calibration=allow_synthetic_calibration,
         )
         self.store = zarr.open_group(str(self.path), mode="r")
+        self.feedback_streams = (
+            load_feedback_streams(self.path) if self.state_history_offsets_s else None
+        )
+        if self.state_history_offsets_s:
+            for side in ("left", "right"):
+                if f"source.{side}.robot_timestamp" not in self.store:
+                    raise ValueError(
+                        "History replay requires recorded feedback availability timestamps"
+                    )
         self.timestamps = np.asarray(
             self.store["timestamp"][: self.metadata["total_frames"]], dtype=float
         )
@@ -101,6 +122,8 @@ class RecordedObservationProvider:
             frame.base_state,
             {name: stamp + (value - original) for name, value in source.items()},
             image_space="processed",
+            base_state_history=frame.base_state_history,
+            state_history_offsets_s=frame.state_history_offsets_s,
         )
 
     def read_frame(self, index):
@@ -153,12 +176,24 @@ class RecordedObservationProvider:
                     "offline_observation_time_proxy_not_measured_source_time"
                 )
         self.source_timestamp_semantics = semantics
+        history = None
+        if self.state_history_offsets_s:
+            from egomimic.robot.piper_pico.state_history import sample_state_history
+
+            history = sample_state_history(
+                self.feedback_streams,
+                original,
+                self.state_history_offsets_s,
+                available_until=[source[side] for side in ("left", "right")],
+            )
         return ObservationFrame(
             original,
             images,
             np.asarray(state),
             source,
             image_space="processed",
+            base_state_history=history,
+            state_history_offsets_s=self.state_history_offsets_s,
         )
 
 

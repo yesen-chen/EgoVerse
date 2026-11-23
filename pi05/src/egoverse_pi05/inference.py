@@ -4,7 +4,7 @@ import copy
 
 import numpy as np
 
-from egoverse_pi05.assets import CAMERAS
+from egoverse_pi05.assets import CAMERAS, history_offsets
 
 
 class BimanualInferencePolicy:
@@ -38,6 +38,9 @@ class BimanualInferencePolicy:
             "prompt",
             *(f"observation.images.{camera}" for camera in CAMERAS),
         }
+        offsets = history_offsets(self._metadata.get("state_history"))
+        if offsets:
+            expected.add("observation.state_history")
         if set(observation) != expected:
             raise ValueError(f"Expected exactly {sorted(expected)}")
         for camera, shape in self._metadata["image_shapes"].items():
@@ -49,6 +52,12 @@ class BimanualInferencePolicy:
         state = np.asarray(observation["observation.state"])
         if state.shape != (14,) or not np.isfinite(state).all():
             raise ValueError("Expected 14 finite physical XYZ/YPR/gripper state values")
+        if offsets:
+            history = np.asarray(observation["observation.state_history"])
+            if history.shape != (len(offsets), 14) or not np.isfinite(history).all():
+                raise ValueError(
+                    f"Expected {len(offsets)} x 14 finite state_history values"
+                )
         if (
             not isinstance(observation["prompt"], str)
             or not observation["prompt"].strip()
@@ -87,6 +96,7 @@ def create_policy(assets, *, require_single_gpu=False, rtc_config=None):
         BimanualOutputs,
         make_model_config,
         model_transforms,
+        with_history_stats,
     )
 
     # Match training/offline inference initialization order. The pinned OpenPI
@@ -101,9 +111,14 @@ def create_policy(assets, *, require_single_gpu=False, rtc_config=None):
             or devices[0].platform != "gpu"
         ):
             raise RuntimeError("Expose exactly one CUDA GPU for serving")
-    config = make_model_config(assets.metadata["finetune_mode"])
+    history = assets.metadata.get("state_history")
+    config = make_model_config(
+        assets.metadata["finetune_mode"],
+        state_history=history,
+        max_token_len=assets.metadata.get("model_input", {}).get("max_token_len"),
+    )
     stats = normalize.load(assets.norm_stats_path.parent)
-    preprocessing = model_transforms(assets.tokenizer_path, config)
+    preprocessing = model_transforms(assets.tokenizer_path, config, history)
     params = model.restore_params(assets.checkpoint_path / "params", dtype=jnp.bfloat16)
     # Upstream defaults to intersecting trees. Strict loading prevents silently
     # dropping LoRA adapters by restoring them with a base-only model config.
@@ -111,8 +126,11 @@ def create_policy(assets, *, require_single_gpu=False, rtc_config=None):
     policy = Policy(
         network,
         transforms=[
-            BimanualInputs(),
-            transforms.Normalize(stats, use_quantiles=True),
+            BimanualInputs(state_history=history),
+            transforms.Normalize(
+                with_history_stats(stats, bool(history_offsets(history))),
+                use_quantiles=True,
+            ),
             *preprocessing,
         ],
         output_transforms=[
@@ -147,6 +165,11 @@ def warmup_policy(policy, assets):
             "prompt": assets.metadata["manifest"]["episodes"][0]["prompt"],
         }
     )
+    offsets = history_offsets(assets.metadata.get("state_history"))
+    if offsets:
+        observation["observation.state_history"] = np.tile(
+            observation["observation.state"], (len(offsets), 1)
+        )
     result = policy.infer(observation)
     if "rtc" in policy.metadata:
         from egoverse_pi05.rtc import SCHEMA

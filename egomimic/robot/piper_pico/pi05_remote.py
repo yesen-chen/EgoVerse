@@ -143,6 +143,7 @@ class WebSocketRPC:
 
 def _server_contract(server, metadata):
     from egomimic.robot.piper_pico.pi05_data import ACTION_CONTRACT, validate_manifest
+    from egomimic.robot.piper_pico.state_history import validate_history_contract
 
     if not isinstance(server, Mapping):
         raise ValueError("Pi0.5 server metadata must be a mapping")
@@ -157,6 +158,12 @@ def _server_contract(server, metadata):
     if server.get("action_contract") != ACTION_CONTRACT:
         raise ValueError("Pi0.5 server action representation/units disagree")
     manifest = validate_manifest(copy.deepcopy(server.get("manifest")))
+    validate_history_contract(server.get("state_history"))
+    _same(
+        server.get("state_history"),
+        manifest.get("state_history"),
+        "server.state_history vs manifest",
+    )
     for key in ("action_timing", "training_contracts", "image_shapes"):
         if key not in server:
             raise ValueError(f"Pi0.5 server lacks {key}")
@@ -234,6 +241,13 @@ class Pi05RemotePolicy:
             self.server_metadata = copy.deepcopy(rpc.metadata)
             self.timing, self.inference_steps = _server_contract(
                 self.server_metadata, metadata
+            )
+            from egomimic.robot.piper_pico.state_history import (
+                validate_history_contract,
+            )
+
+            self.state_history_offsets_s = validate_history_contract(
+                self.server_metadata.get("state_history")
             )
             prompt = (
                 metadata.get("task_description")
@@ -322,10 +336,21 @@ class Pi05RemotePolicy:
             raise RuntimeError("Pi0.5 connection is closed; restart the session")
         try:
             batch = self.adapter.prepare(frame)[EMBODIMENT]
+            if tuple(frame.state_history_offsets_s) != self.state_history_offsets_s:
+                raise ValueError(
+                    "Observation history offsets differ from the Pi0.5 checkpoint"
+                )
             request = {
                 "observation.state": batch[STATE][0].numpy(),
                 "prompt": self.prompt,
             }
+            if self.state_history_offsets_s:
+                request["observation.state_history"] = np.stack(
+                    [
+                        self.adapter.base_to_camera_state(row)
+                        for row in frame.base_state_history
+                    ]
+                ).astype(np.float32)
             for name, key in CAMERA_KEYS.items():
                 request[f"observation.images.{name}"] = np.ascontiguousarray(
                     batch[key][0].numpy().transpose(1, 2, 0)

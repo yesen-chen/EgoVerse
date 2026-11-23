@@ -851,6 +851,7 @@ def run_session(args, log):
 
 
 def _run_device_session(args, log, contract, policy, limits):
+    history_offsets = tuple(getattr(policy, "state_history_offsets_s", ()))
     policy = ActuatorPolicy(policy, policy.adapter.gripper_open_m, log)
     import multiprocessing as mp
     from multiprocessing.managers import SharedMemoryManager
@@ -878,6 +879,7 @@ def _run_device_session(args, log, contract, policy, limits):
             enable_pico=False,
             enable_motion=args.execute,
             preserve_gripper_on_enable=True,
+            **({"state_history_offsets_s": history_offsets} if history_offsets else {}),
         )
         stack.callback(env.stop)
         env.start()
@@ -895,6 +897,23 @@ def _run_device_session(args, log, contract, policy, limits):
         )
         log.event("devices_ready", execute=args.execute)
         try:
+            if history_offsets:
+                from egomimic.robot.piper_pico.state_history import HistoryCoverageError
+
+                print("[推理] 等待反馈共享内存覆盖模型所需历史。", flush=True)
+                deadline = time.monotonic() - history_offsets[0] + 3.0
+                while True:
+                    if keys.poll() == "stop":
+                        return "stopped"
+                    try:
+                        provider.latest()
+                        break
+                    except HistoryCoverageError:
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError(
+                                "反馈历史覆盖不足，无法开始历史模型推理"
+                            ) from None
+                        time.sleep(0.01)
             print("[推理] 模型预热中，本次预测不执行。", flush=True)
             prediction = policy.predict(provider.latest())
             log.event("warmup", inference_elapsed_s=prediction["inference_elapsed_s"])

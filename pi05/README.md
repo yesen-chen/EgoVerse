@@ -18,6 +18,8 @@
 
 Piper 单独训练仍沿用上述路径。PICO Ego 与 Piper 混合训练现已提供独立导出入口，支持各自的源动作窗口、Ego 完整未来窗口限制、分域归一化及缺失腕部图像 mask。详见 [PICO Ego 混合训练操作说明](README_pico_ego_mixed.md)。混合模型的机器人部署继续使用 Piper 时间和反归一化统计。
 
+可选的 TCP/夹爪历史输入、已有数据补回填、训练/推理一致性检查和历史 LoRA 测试见 [历史状态使用说明](README_state_history.md)。默认不启用历史，旧模型继续使用原路径。
+
 ## 1. 用户配置 JAX 环境
 
 参考项目为 `/home/yesen/cys/avfrl_real/pi05`。OpenPI 固定为：
