@@ -11,6 +11,8 @@ import copy
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from numbers import Real
 from pathlib import Path
 
 import cv2
@@ -58,6 +60,8 @@ class ObservationFrame:
     image_space: str = "raw"
     base_state_history: np.ndarray | None = None
     state_history_offsets_s: tuple[float, ...] = ()
+    image_frame_ids: Mapping[str, int] = dataclass_field(default_factory=dict)
+    image_receive_timestamps: Mapping[str, float] = dataclass_field(default_factory=dict)
 
     def validate(self):
         if self.image_space not in ("raw", "processed"):
@@ -89,6 +93,28 @@ class ObservationFrame:
             )
         if not np.isfinite(list(self.source_timestamps.values())).all():
             raise ValueError("source timestamps must be finite")
+        for label, values in (
+            ("image_frame_ids", self.image_frame_ids),
+            ("image_receive_timestamps", self.image_receive_timestamps),
+        ):
+            if not isinstance(values, Mapping):
+                raise ValueError(f"{label} must be a mapping")
+            if values and set(values) != set(CAMERA_KEYS):
+                raise ValueError(f"{label} must identify all three cameras")
+        for value in self.image_frame_ids.values():
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, np.integer))
+                or not 0 <= value <= np.iinfo(np.int64).max
+            ):
+                raise ValueError("image_frame_ids must be nonnegative int64 IDs")
+        for value in self.image_receive_timestamps.values():
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, Real)
+                or not np.isfinite(value)
+            ):
+                raise ValueError("image_receive_timestamps must be finite numbers")
 
     def check_freshness(self, now, max_age_s, future_tolerance_s=0.02):
         self.validate()
@@ -145,6 +171,16 @@ class ObservationFrame:
                 else None
             ),
             state_history_offsets_s=tuple(obs.get("state_history_offsets_s", ())),
+            image_frame_ids={
+                name: np.asarray(obs[f"camera{i}_frame_id"])[-1].item()
+                for i, name in enumerate(camera_names)
+                if f"camera{i}_frame_id" in obs
+            },
+            image_receive_timestamps={
+                name: np.asarray(obs[f"camera{i}_receive_timestamp"])[-1].item()
+                for i, name in enumerate(camera_names)
+                if f"camera{i}_receive_timestamp" in obs
+            },
         )
         frame.validate()
         return frame

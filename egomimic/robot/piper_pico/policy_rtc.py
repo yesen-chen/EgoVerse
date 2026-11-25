@@ -456,6 +456,7 @@ def run_rtc_loop(
                 "status": "completed",
                 "timing_mode": "rtc",
                 "hold_attempted": False,
+                "audit_request_id": prediction.get("audit_request_id"),
                 "observation_timestamp": float(frame.timestamp),
                 "measured_base_state": np.asarray(frame.base_state),
                 "source_timestamps": dict(frame.source_timestamps),

@@ -26,7 +26,11 @@ from egomimic.robot.piper_pico.clutch import (
     action_from_sample,
     xyzw_to_wxyz,
 )
-from egomimic.robot.piper_pico.interpolate import align_bimanual_obs, rpy_to_rotvec_pose
+from egomimic.robot.piper_pico.interpolate import (
+    align_bimanual_obs,
+    latest_at_or_before,
+    rpy_to_rotvec_pose,
+)
 from egomimic.robot.piper_pico.pico_camera import PicoCameraProcess
 from egomimic.robot.piper_pico.pico_process import PicoProcess
 from egomimic.robot.piper_pico.record import (
@@ -306,6 +310,19 @@ class PiperPicoEnv:
             query_time=query_time,
             robot_joint_positions=[data["joint_pos"] for data in robot_data],
         )
+        for index, data in enumerate(camera_data):
+            # Use the alignment's exact index rule on the same snapshots and
+            # query times. Looking up by the selected timestamp alone loses
+            # frame identity when multiple frames share a timestamp.
+            indices = latest_at_or_before(data["timestamp"], obs["timestamp"])
+            for source_key, obs_suffix in (
+                ("frame_id", "frame_id"),
+                ("camera_receive_timestamp", "receive_timestamp"),
+            ):
+                if source_key in data:
+                    obs[f"camera{index}_{obs_suffix}"] = np.asarray(data[source_key])[
+                        indices
+                    ].copy()
         history_offsets = getattr(self, "state_history_offsets_s", ())
         if history_offsets:
             from egomimic.robot.piper_pico.state_history import sample_state_history

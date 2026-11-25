@@ -56,7 +56,35 @@ def camera_examples(height: int, width: int) -> dict:
         "color": np.zeros((height, width, 3), dtype=np.uint8),
         "timestamp": np.float64(0.0),
         "camera_receive_timestamp": np.float64(0.0),
+        "frame_id": np.int64(0),
     }
+
+
+def read_camera_snapshot(ring: SharedMemoryRingBuffer, k: int, name: str) -> dict:
+    """Copy recent frames without returning a potentially overwritten snapshot.
+
+    The ring is single-writer and its copy API does not lock that writer. It
+    reloads the publication count internally, so conservatively protect the
+    oldest sample that could have been selected at our initial count. A writer
+    can already be modifying its next slot before advancing the count.
+    """
+    started = time.monotonic()
+    before = int(ring.count)
+    available = min(k, before, ring.get_max_k)
+    if available <= 0:
+        raise RuntimeError(f"camera {name} has no frames")
+    data = ring.get_last_k(available)
+    elapsed = time.monotonic() - started
+    after = int(ring.count)
+    if elapsed > ring.get_time_budget:
+        raise RuntimeError(
+            f"camera {name}: shared-memory snapshot exceeded its read budget"
+        )
+    if after < before or after >= before - available + ring.buffer_size:
+        raise RuntimeError(
+            f"camera {name}: shared-memory snapshot may have been overwritten or reset"
+        )
+    return data
 
 
 def _open_writer(
@@ -130,6 +158,7 @@ def camera_process_loop(
     receive_timestamps: list[float] = []
     video_path: Path | None = None
     recording_metadata = None
+    next_frame_id = 0
 
     def close_recording(container, stream, path, stamps, received_stamps, metadata):
         if container is None:
@@ -263,8 +292,12 @@ def camera_process_loop(
                     "color": rgb,
                     "timestamp": np.float64(calibrated),
                     "camera_receive_timestamp": np.float64(received),
+                    "frame_id": np.int64(next_frame_id),
                 }
             )
+            # Identifies a published frame for this worker's lifetime, including
+            # across recording boundaries. Failed reads do not consume an ID.
+            next_frame_id += 1
             if not ready_event.is_set():
                 ready_event.set()
             if container is not None and stream is not None:
@@ -409,10 +442,7 @@ class CameraProcess:
         self.process.start()
 
     def get_last(self, k: int) -> dict:
-        available = min(k, self.ring.count, self.ring.get_max_k)
-        if available <= 0:
-            raise RuntimeError(f"camera {self.name} has no frames")
-        return self.ring.get_last_k(available)
+        return read_camera_snapshot(self.ring, k, self.name)
 
     def start_recording(self, path: str, timeout: float = 5.0) -> None:
         self.commands.put({"cmd": "start", "path": path})

@@ -105,6 +105,7 @@ def run_sync_cycle(
             report["recording_observation"] = dict(provider.last_record)
         started = time.perf_counter()
         prediction = policy.predict(frame)
+        report["audit_request_id"] = prediction.get("audit_request_id")
         report["measured_inference_elapsed_s"] = time.perf_counter() - started
         report["policy_inference_elapsed_s"] = float(prediction["inference_elapsed_s"])
         report["inference_steps"] = int(prediction["inference_steps"])

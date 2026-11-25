@@ -22,7 +22,11 @@ from queue import Empty
 
 import numpy as np
 
-from egomimic.robot.piper_pico.camera_process import camera_examples, stop_camera_process
+from egomimic.robot.piper_pico.camera_process import (
+    camera_examples,
+    read_camera_snapshot,
+    stop_camera_process,
+)
 from egomimic.robot.piper_pico.shm import SharedMemoryRingBuffer
 
 MAX_PACKET = 16 * 1024 * 1024
@@ -118,13 +122,18 @@ def _put_eye(ring: SharedMemoryRingBuffer, bgr: np.ndarray, received: float, lat
     if bgr.shape[1] != width or bgr.shape[0] != height:
         bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA)
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    # This attribute belongs to the single writer's ring object; clearing a
+    # reader buffer or starting another recording must not reuse frame IDs.
+    frame_id = getattr(ring, "_pico_next_frame_id", 0)
     ring.put(
         {
             "color": rgb,
             "timestamp": np.float64(received - float(latency)),
             "camera_receive_timestamp": np.float64(received),
+            "frame_id": np.int64(frame_id),
         }
     )
+    ring._pico_next_frame_id = frame_id + 1
     return rgb
 
 
@@ -349,10 +358,7 @@ class EyeView:
         self.ring = ring
 
     def get_last(self, k: int) -> dict:
-        available = min(k, self.ring.count, self.ring.get_max_k)
-        if available <= 0:
-            raise RuntimeError(f"camera {self.name} has no frames")
-        return self.ring.get_last_k(available)
+        return read_camera_snapshot(self.ring, k, self.name)
 
 
 class PicoStereoProcess:

@@ -1,6 +1,6 @@
 {
   "schema": "camera_rig_v1",
-  "description": "Current hardware UVC rig, roles confirmed by user on 2026-11-05: LRCP front USB 5.3.2, left wrist 5.3.3, right wrist 5.3.4 on controller 0f:00.0. All streams 640x480 MJPG 30 fps, manual exposure 20 ms (auto_exposure=1, exposure_time_absolute=200), brightness 48. Controls are applied and verified at camera startup. The 15-second three-stream preview passed at approximately 30 fps per camera: diagnostics/uvc_all_20ms_brightness48_preview_001/capture/report.json. At user request, retain previous latency compensation without remeasurement: front 0.067275 s (pooled single-stream estimate including unmeasured display delay), wrists 0.066 s. latency_status=unmeasured describes the current settings; numeric compensation remains active. Front uses calibrated LRCP raw intrinsics. Serial IDs collide, and front/left also share VID/PID/revision, so by-path binding is required. Keep these camera-to-port assignments; a front/left physical swap cannot be detected from USB identity alone. Old KD calibration belongs only to historical recordings.",
+  "description": "Current hardware UVC rig, USB bindings checked on 2026-11-24: front USB 5.2, left wrist 1.2, right wrist 1.4.3 on controller 0d:00.0. All streams 640x480 MJPG 30 fps, manual exposure 20 ms (auto_exposure=1, exposure_time_absolute=200), brightness 48. Controls are applied and verified at camera startup. The 15-second three-stream preview passed at approximately 30 fps per camera: diagnostics/uvc_all_20ms_brightness48_preview_001/capture/report.json. At user request, retain previous latency compensation without remeasurement: front 0.067275 s (pooled single-stream estimate including unmeasured display delay), wrists 0.066 s. latency_status=unmeasured describes the current settings; numeric compensation remains active. Front uses calibrated LRCP raw intrinsics. Serial IDs collide, and front/left also share VID/PID/revision, so by-path binding is required. Keep these camera-to-port assignments; a front/left physical swap cannot be detected from USB identity alone. Old KD calibration belongs only to historical recordings.",
   "cameras": [
     {
       "name": "front_1",
@@ -40,7 +40,7 @@
         ],
         "report_paths_relative_to": "EgoVerse repository root"
       },
-      "binding_note": "User-confirmed front on USB 5.3.2. Front and left_wrist share all stable USB identity fields; port assignment remains required.",
+      "binding_note": "USB binding checked 2026-11-24: front_1 on 5.2, controller 0d:00.0. User identified first reconnected wrist as left and second as right; udev initialization order and existing VID/PID/revision agree. Serial IDs collide, so retain by-path binding.",
       "latency_reuse": {
         "policy": "reuse_previous_compensation",
         "decision_date": "2026-11-05",
@@ -56,7 +56,7 @@
     {
       "name": "left_wrist",
       "type": "uvc",
-      "device": "/dev/v4l/by-path/pci-0000:0d:00.0-usb-0:1.1:1.0-video-index0",
+      "device": "/dev/v4l/by-path/pci-0000:0d:00.0-usb-0:1.2:1.0-video-index0",
       "width": 640,
       "height": 480,
       "fps": 30,
@@ -73,7 +73,7 @@
         "ID_MODEL_ID": "22c8",
         "ID_REVISION": "0039",
         "ID_SERIAL": "LRCP_F1080P_LRCP_F1080P_000000000001",
-        "ID_PATH": "pci-0000:0d:00.0-usb-0:1.1:1.0"
+        "ID_PATH": "pci-0000:0d:00.0-usb-0:1.2:1.0"
       },
       "latency_note": "Existing 0.066 s copied from right-wrist measurement uvc_right_wrist_latency_002; left wrist has not been independently measured. Compensation is retained for manual 20 ms exposure and brightness 48 at user request without remeasurement.",
       "latency_reuse": {
@@ -81,12 +81,13 @@
         "decision_date": "2026-11-05",
         "reason": "User explicitly requested retaining previous latency compensation without remeasurement after adopting manual 20 ms exposure and brightness 48.",
         "verified_for_current_controls_and_workload": false
-      }
+      },
+      "binding_note": "USB binding checked 2026-11-24: left_wrist on 1.2, controller 0d:00.0. User identified first reconnected wrist as left and second as right; udev initialization order and existing VID/PID/revision agree. Serial IDs collide, so retain by-path binding."
     },
     {
       "name": "right_wrist",
       "type": "uvc",
-      "device": "/dev/v4l/by-path/pci-0000:0d:00.0-usb-0:1.4.1:1.0-video-index0",
+      "device": "/dev/v4l/by-path/pci-0000:0d:00.0-usb-0:1.4.3:1.0-video-index0",
       "width": 640,
       "height": 480,
       "fps": 30,
@@ -103,7 +104,7 @@
         "ID_MODEL_ID": "2cc8",
         "ID_REVISION": "0031",
         "ID_SERIAL": "LRCP_F1080P_LRCP_F1080P_000000000001",
-        "ID_PATH": "pci-0000:0d:00.0-usb-0:1.4.1:1.0"
+        "ID_PATH": "pci-0000:0d:00.0-usb-0:1.4.3:1.0"
       },
       "latency_note": "Existing 0.066 s from diagnostics/uvc_right_wrist_latency_002; new three-stream workload has not been measured. Compensation is retained for manual 20 ms exposure and brightness 48 at user request without remeasurement.",
       "latency_reuse": {
@@ -111,7 +112,8 @@
         "decision_date": "2026-11-05",
         "reason": "User explicitly requested retaining previous latency compensation without remeasurement after adopting manual 20 ms exposure and brightness 48.",
         "verified_for_current_controls_and_workload": false
-      }
+      },
+      "binding_note": "USB binding checked 2026-11-24: right_wrist on 1.4.3, controller 0d:00.0. User identified first reconnected wrist as left and second as right; udev initialization order and existing VID/PID/revision agree. Serial IDs collide, so retain by-path binding."
     }
   ]
 }

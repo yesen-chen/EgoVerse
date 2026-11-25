@@ -277,6 +277,8 @@ RTC 是可选的推理方式，不需要重新训练，现有 checkpoint、归�
 
 OpenPI 以 `t=1→0` 采样，RTC 的去噪估计为 `x-t*v`，引导项从速度场减去。物理前缀先转为训练时的相机坐标 XYZ/YPR/归一化夹爪开度，再使用训练集的 action quantile normalization，补齐到32维；额外18维不贡献前缀误差。代码位于本项目 `pi05/src/egoverse_pi05/rtc.py`，不修改固定版本的 OpenPI 源码。
 
+服务端可选 `--rtc-guidance-mode identity`（必须与 `--rtc` 配合），将去噪估计的 Jacobian 近似为单位矩阵；前缀误差、权重、引导系数和 flow 时间方向保持不变。这是用于 chunk 衔接对照的实验选项，不需要重新训练。默认仍为 `--rtc-guidance-mode vjp`，启动摘要的 `rtc.method` 分别显示 `denoised_prefix_identity` 或 `denoised_prefix_vjp`。切换此选项需要重新启动服务；客户端、SG 和 transition 参数可保持原值，以便单独比较引导方式。离线旧观测回放不能证明闭环抓取成功率提高。
+
 先在原服务终端按 Ctrl+C 退出旧服务，再用**已有 JAX 环境**启动 RTC 服务：
 
 ```bash

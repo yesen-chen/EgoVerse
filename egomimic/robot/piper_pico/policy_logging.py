@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import multiprocessing as mp
 import os
+import signal
 import time
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from queue import Full
 
@@ -30,16 +32,23 @@ def _json_default(value):
     raise TypeError(f"Cannot log {type(value).__name__}")
 
 
-def _write_loop(directory, records, status):
+def _write_loop(directory, records, status, *, kinds=KINDS):
     """No model/device imports and no access to robot command channels."""
-    written = dict.fromkeys(KINDS, 0)
+    # Terminal Ctrl+C is handled by the parent, which holds the robot and sends
+    # a drain sentinel. Do not lose queued evidence to a process-group SIGINT.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        os.nice(5)
+    except (AttributeError, OSError):
+        pass
+    written = dict.fromkeys(kinds, 0)
     try:
         with ExitStack() as stack:
             streams = {
                 kind: stack.enter_context(
                     (Path(directory) / f"{kind}.jsonl").open("x", buffering=1)
                 )
-                for kind in KINDS
+                for kind in kinds
             }
             status.send(("ready", {"pid": os.getpid()}))
             while True:
@@ -84,18 +93,27 @@ class AsyncLogWriter:
         capacity=256,
         startup_timeout=20.0,
         close_timeout=5.0,
+        kinds=KINDS,
         _worker_target=_write_loop,
     ):
         if capacity < 1 or startup_timeout <= 0 or close_timeout <= 0:
             raise ValueError("log capacity and timeouts must be positive")
+        self.kinds = tuple(kinds)
+        if (
+            not self.kinds
+            or len(set(self.kinds)) != len(self.kinds)
+            or any(kind not in (*KINDS, "requests") for kind in self.kinds)
+        ):
+            raise ValueError("log kinds must be nonempty, unique supported streams")
         self.close_timeout = close_timeout
         self.stats = {
             "enabled": True,
             "mode": "process",
             "queue_capacity": capacity,
-            "submitted": dict.fromkeys(KINDS, 0),
-            "dropped": dict.fromkeys(KINDS, 0),
-            "written": dict.fromkeys(KINDS, 0),
+            "kinds": list(self.kinds),
+            "submitted": dict.fromkeys(self.kinds, 0),
+            "dropped": dict.fromkeys(self.kinds, 0),
+            "written": dict.fromkeys(self.kinds, 0),
             "errors": [],
             "incomplete": False,
             "drained": False,
@@ -106,9 +124,14 @@ class AsyncLogWriter:
         self._queue = ctx.Queue(maxsize=capacity)
         self._status, child_status = ctx.Pipe(duplex=False)
         self._process = ctx.Process(
-            target=_worker_target,
+            # Keep injected workers' original three-argument interface.
+            target=partial(_write_loop, kinds=self.kinds)
+            if _worker_target is _write_loop
+            else _worker_target,
             args=(str(directory), self._queue, child_status),
-            name="piper_policy_log",
+            name="piper_policy_request_log"
+            if self.kinds == ("requests",)
+            else "piper_policy_log",
             daemon=True,
         )
         try:
@@ -136,6 +159,8 @@ class AsyncLogWriter:
 
     def submit(self, kind, payload):
         """Payload must be an owned snapshot, never subsequently mutated."""
+        if kind not in self.kinds:
+            raise ValueError(f"log stream {kind!r} is not owned by this writer")
         if self._closed or self._failed:
             self.stats["dropped"][kind] += 1
             self.stats["incomplete"] = True
@@ -214,7 +239,7 @@ class AsyncLogWriter:
             self._closed = True
             self.stats["unwritten"] = {
                 kind: self.stats["submitted"][kind] - self.stats["written"][kind]
-                for kind in KINDS
+                for kind in self.kinds
             }
             if any(self.stats["unwritten"].values()):
                 self.stats["incomplete"] = True

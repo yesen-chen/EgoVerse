@@ -98,6 +98,7 @@ def state_examples() -> dict:
         "robot_pose_source_timestamp": np.float64(np.nan),
         "robot_gripper_source_timestamp": np.float64(np.nan),
         "robot_source_timestamps_simulated": np.uint8(0),
+        "feedback_id": np.int64(-1),
         "last_command_id": np.int64(-1),
         "last_command_send_timestamp": np.float64(np.nan),
     }
@@ -150,6 +151,9 @@ def read_arm_state(
             received if simulated else feedback["robot_gripper_source_timestamp"]
         ),
         "robot_source_timestamps_simulated": np.uint8(simulated),
+        # Assigned by the publishing loop; this standalone read is not yet a
+        # published sample. It never substitutes for the CAN source timestamps.
+        "feedback_id": np.int64(-1),
         "last_command_id": np.int64(last_command_id),
         "last_command_send_timestamp": np.float64(last_command_send_timestamp),
     }
@@ -183,6 +187,7 @@ def arm_process_loop(
     last_home_send = 0.0
     last_command_id = -1
     last_command_send = np.nan
+    next_feedback_id = 0
     try:
         if preserve_gripper_on_enable and enable_motion and not simulate:
             arm.connect(enable=True, preserve_gripper_on_enable=True)
@@ -201,12 +206,13 @@ def arm_process_loop(
                 if held_event is not None:
                     held_event.set()
             try:
-                ring.put(
-                    read_arm_state(
-                        arm, receive_latency, last_command_id, last_command_send,
-                        simulated=simulate,
-                    )
+                state = read_arm_state(
+                    arm, receive_latency, last_command_id, last_command_send,
+                    simulated=simulate,
                 )
+                state["feedback_id"] = np.int64(next_feedback_id)
+                ring.put(state)
+                next_feedback_id += 1
                 if not ready_event.is_set():
                     ready_event.set()
             except Exception as exc:

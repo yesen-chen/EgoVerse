@@ -18,18 +18,30 @@ def main():
     parser.add_argument(
         "--rtc",
         action="store_true",
-        help="Enable training-free denoised-prefix VJP guidance",
+        help="Enable training-free denoised-prefix guidance",
     )
     parser.add_argument("--rtc-max-guidance", type=float, default=5.0)
+    parser.add_argument(
+        "--rtc-guidance-mode",
+        choices=("vjp", "identity"),
+        default="vjp",
+        help="RTC Jacobian rule: full VJP (default) or experimental identity approximation",
+    )
     args = parser.parse_args()
     if not args.host.strip() or not 1 <= args.port <= 65535:
         parser.error("A nonempty host and port 1..65535 are required")
+    if args.rtc_guidance_mode != "vjp" and not args.rtc:
+        parser.error("--rtc-guidance-mode identity requires --rtc")
     setup(cpu=args.check_only, openpi_root=args.openpi_root)
     from egoverse_pi05.assets import inference_summary, load_inference_assets
     from egoverse_pi05.rtc import RtcConfig
 
     assets = load_inference_assets(args.checkpoint_path, args.num_inference_steps)
-    rtc_config = RtcConfig(args.rtc_max_guidance) if args.rtc else None
+    rtc_config = (
+        RtcConfig(args.rtc_max_guidance, guidance_mode=args.rtc_guidance_mode)
+        if args.rtc
+        else None
+    )
     summary = inference_summary(assets.metadata)
     if rtc_config is not None:
         summary["rtc"] = rtc_config.metadata()

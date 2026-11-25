@@ -4,8 +4,9 @@ Implements Black et al., Real-Time Execution of Action Chunking Flow Policies,
 Eq. 2--4 / Algorithm 1: https://www.pi.website/download/real_time_chunking.pdf.
 OpenPI runs noise time t=1 to data time t=0, opposite to the paper's tau.
 The denoised estimate is x - t*v and guidance is SUBTRACTED from v, because
-the Euler integration step is negative. This is VJP guidance through the full
-action expert, not endpoint replacement or output blending.
+the Euler integration step is negative. Full action-expert VJP is the default;
+an explicit experimental mode approximates the denoised Jacobian by identity.
+Neither mode replaces endpoints or blends output actions.
 """
 
 import time
@@ -19,6 +20,7 @@ SCHEMA = "egoverse_rtc_v1"
 @dataclass(frozen=True)
 class RtcConfig:
     max_guidance: float = 5.0
+    guidance_mode: str = "vjp"
 
     def __post_init__(self):
         if (
@@ -27,12 +29,14 @@ class RtcConfig:
             or self.max_guidance <= 0
         ):
             raise ValueError("RTC max_guidance must be finite and positive")
+        if self.guidance_mode not in ("vjp", "identity"):
+            raise ValueError("RTC guidance_mode must be 'vjp' or 'identity'")
 
     def metadata(self):
         return {
             "schema": SCHEMA,
             "max_guidance": float(self.max_guidance),
-            "method": "denoised_prefix_vjp",
+            "method": f"denoised_prefix_{self.guidance_mode}",
             "prefix_space": "physical_camera_actions",
             "action_horizon": 100,
             "action_dim": 14,
@@ -114,6 +118,14 @@ def guided_velocity(velocity, x, t, previous, mask, maximum=5.0):
     return v - guidance_scale(t, maximum) * correction
 
 
+def identity_guided_velocity(velocity, x, t, previous, mask, maximum=5.0):
+    """Experimental identity-Jacobian guidance; keep the same error and scale."""
+    v = velocity(x, t)
+    clean = x - t * v
+    error = (previous - clean) * mask
+    return v - guidance_scale(t, maximum) * error
+
+
 def make_sampler(network, config):
     """Wrap an immutable trained network without changing vendored OpenPI."""
     import flax.nnx as nnx
@@ -122,6 +134,13 @@ def make_sampler(network, config):
     from openpi.models import model as model_module
     from openpi.models.pi0 import make_attn_mask
     from openpi.shared.nnx_utils import module_jit
+
+    # Bind the rule for this sampler's lifetime, before JAX's lazy tracing.
+    selected_guidance = (
+        identity_guided_velocity
+        if config.guidance_mode == "identity"
+        else guided_velocity
+    )
 
     class RtcModel(nnx.Module):
         def __init__(self, network):
@@ -181,7 +200,7 @@ def make_sampler(network, config):
                     jnp.any(mask > 0),
                     lambda: x
                     + dt
-                    * guided_velocity(
+                    * selected_guidance(
                         velocity, x, t, previous, mask, config.max_guidance
                     ),
                     lambda: x + dt * velocity(x, t),

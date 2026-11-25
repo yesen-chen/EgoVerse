@@ -112,3 +112,64 @@ CUDA_VISIBLE_DEVICES=0 python -m pytest --integration -m gpu -q \
 ```
 
 建议对照实验固定图像、动作定义、数据划分和优化器设置，仅改变历史输入。若历史覆盖过滤删除了部分行，比较时使用相同有效 observation 行，不能将不同数据子集的差异全归因于历史。训练结束后再分别量化 chunk 内部变化、接管残差和静止重复预测；这些测试通过只说明管线符合约定，不代表模型已经改善抖动。
+
+## 离线对比历史模型的 RTC 换段
+
+`evaluate_pi05_rtc_history.py` 直接使用既有 JAX 模型推理路径及生产 RTC 前缀、滤波、过渡实现，不连接相机、CAN 或机器人。每组取相隔 `execute-steps` 个源数据行的两个观测；当前状态、三图和历史均由训练 manifest 的数据加载器读取。历史来自原始反馈侧车文件，不用前一次模型请求代替。需要本地可解析的、内容与 checkpoint 内嵌清单完全相同的 manifest。
+
+对每个 checkpoint 分别运行，保持采样和 RTC 参数一致，输出目录必须不存在：
+
+```bash
+cd /home/yesen/pico_ego_probe/EgoVerse
+source emimic/bin/activate
+CUDA_VISIBLE_DEVICES=0 ./pi05/.venv/bin/python pi05/scripts/evaluate_pi05_rtc_history.py \
+  --checkpoint-path "$CHECKPOINT" --manifest "$MANIFEST" \
+  --output-dir "$OUTPUT" \
+  --pairs-per-episode 6 --execute-steps 27 --control-frequency 30 \
+  --delay-ms 170 --transition-ms 300 --smoothing-ms 150 \
+  --num-inference-steps 10 --rtc-max-guidance 20 --seed 42
+```
+
+以上参数适用于 h50、30 Hz、100 点模型。更短 horizon 必须缩短重规划间隔或过渡，脚本会校验轨迹重叠范围。`--prepare-only` 仅核查清单和选择样本，不加载模型执行推理。输出包含清单、参数、样本选择、逐组 JSON 指标以及保存动作、前缀、噪声、过渡轨迹的 NPZ，便于复查。
+
+三种条件分别是普通预测对接该模型上一段预测、RTC 对接该模型上一段预测、RTC 对接所有模型共用的录制命令前缀。各模型和各当前预测条件使用相同显式噪声，比较前还必须核对 `selection_sha256`。换段位置差比较**同一接管时刻**的新旧命令；二阶差分按 30 Hz 计算，反映轨迹变化程度，也包含正常加减速。过渡在入口的零位置差由融合公式保证，不能用来声称模型已解决换段问题。
+
+这是两个 chunk 的配对离线测试：第二次观测仍来自录制数据，不会随第一次预测改变。训练集上的结果不能代替闭环测试或泛化评估。历史真机日志若未保存图像和高频反馈，不能据此重新构造完整历史模型输入。
+
+将三次结果分别保存为同一个父目录下的 `baseline/`、`history_33ms/` 和 `history_66_33ms/` 后，可生成配对统计和图表：
+
+```bash
+python pi05/scripts/report_pi05_rtc_history.py \
+  --root diagnostics/pi05_history_rtc_20261124
+```
+
+报告先校验样本、时间轴、随机噪声参数和静止分类匹配，再按 episode 整组抽样计算历史模型相对基线的均值差及区间。重复采样同一条 episode 中的多个窗口不能被当成独立 episode。
+
+相关 CPU 测试：
+
+```bash
+CUDA_VISIBLE_DEVICES='' python -m pytest -q \
+  tests/unit/test_pi05_rtc_evaluation.py \
+  tests/unit/test_pi05_rtc_history_selection.py \
+  tests/unit/test_pi05_rtc_history_report.py \
+  tests/unit/test_policy_continuity.py \
+  tests/unit/test_policy_rtc_continuity.py
+```
+
+## 调试离线与真机换段差异
+
+`debug_pi05_rtc_chain.py` 用连续录制观测比较独立两段预测与递归 RTC 前缀，输出不反馈为下一次观测，所以仍不是机器人闭环模拟。`debug_pi05_rtc_sensitivity.py` 在既有 baseline 评估上选择运动窗口，保持噪声、模型和时间轴，分别干预旧计划、反馈和图像，检查前缀冲突；人为干预幅度不能当作真机已测偏差。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./pi05/.venv/bin/python pi05/scripts/debug_pi05_rtc_chain.py \
+  --checkpoint-path "$CHECKPOINT" --manifest "$MANIFEST" \
+  --output-dir diagnostics/rtc_chain_new_run --max-episodes 8
+
+CUDA_VISIBLE_DEVICES=0 ./pi05/.venv/bin/python pi05/scripts/debug_pi05_rtc_sensitivity.py \
+  --baseline-evaluation diagnostics/pi05_history_rtc_20261124/baseline \
+  --output-dir diagnostics/rtc_sensitivity_new_run
+```
+
+参考仓库实际采用的 identity Jacobian 近似可通过单独的诊断入口比较：将上面脚本入口分别换成 `pi05/scripts/debug_pi05_rtc_guidance.py chain` 或 `pi05/scripts/debug_pi05_rtc_guidance.py sensitivity`，其余参数相同并换新的输出目录。每个变体必须使用独立进程，避免 JAX 编译缓存混用。正式服务依然使用完整 VJP，没有修改默认行为。更紧地跟随旧前缀可能保留错误动作，报告必须同时检查任务目标误差和合理纠错，不能只比较衔接差。
+
+新增测试为 `test_pi05_rtc_chain_debug.py`、`test_pi05_rtc_sensitivity.py`、`test_rtc_blend_correction.py`、`test_rtc_reference_gradient_order.py`，均在 `tests/unit/`，无需硬件或模型权重。

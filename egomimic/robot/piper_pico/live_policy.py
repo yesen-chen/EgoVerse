@@ -205,7 +205,41 @@ def build_parser():
         type=Path,
         help="New directory; default diagnostics/piper_live_<UTC>_<id> or piper_offline_eval_<UTC>_<id>",
     )
+    parser.add_argument(
+        "--record-images",
+        choices=("off", "requests", "all"),
+        default="off",
+        help="Background recording: exact request PNGs, or all camera frames plus request PNGs; requires --log",
+    )
+    parser.add_argument(
+        "--record-video-format",
+        choices=("mp4", "lossless"),
+        default="mp4",
+        help="With --record-images all: segmented MP4 or lossless PNG frames; request snapshots are always lossless",
+    )
+    parser.add_argument(
+        "--record-feedback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Record both arms' continuous SHM feedback in a separate process; requires --log",
+    )
+    parser.add_argument("--record-queue-capacity", type=_positive_int, default=64)
+    parser.add_argument("--record-cache-frames", type=_positive_int, default=90)
+    parser.add_argument("--record-segment-seconds", type=_positive_float, default=60.0)
     return parser
+
+
+def validate_recording_args(args):
+    enabled = getattr(args, "record_images", "off") != "off" or getattr(
+        args, "record_feedback", False
+    )
+    if enabled and not getattr(args, "log", True):
+        raise ValueError("图像/反馈记录需要 --log，以保存请求、动作及配置关联。")
+    if enabled and getattr(args, "offline_eval", False):
+        raise ValueError(
+            "--record-images/--record-feedback 只用于实时推理；离线评估不会打开设备。"
+        )
+    return enabled
 
 
 class KeyboardControl:
@@ -269,7 +303,7 @@ def _json(value, *, indent=None):
 
 
 class SessionLog:
-    """Small counters locally; optional JSONL encoding/writes in a child process."""
+    """Independent bounded control/request loggers; no shared producer lock."""
 
     def __init__(self, directory, args):
         self.directory = Path(directory)
@@ -277,8 +311,10 @@ class SessionLog:
         self.enabled = bool(getattr(args, "log", True))
         self._closed = False
         self._warnings = set()
+        self.recorder = None
         # The streaming loop's inference thread may publish gripper events.
         self._publish_lock = threading.Lock()
+        self._request_publish_lock = threading.Lock()
         self.summary = {
             "status": "initializing",
             "execute": bool(args.execute),
@@ -299,20 +335,59 @@ class SessionLog:
         self.first_send = self.last_send = None
         # Metadata is written at startup/shutdown, outside the action loop.
         (self.directory / "arguments.json").write_text(_json(vars(args), indent=2))
-        self._writer = AsyncLogWriter(self.directory) if self.enabled else None
+        self._writer = self._request_writer = None
+        if self.enabled:
+            # Start both writers before device/control startup. A large policy
+            # request must not occupy command queue slots or its producer lock.
+            self._writer = AsyncLogWriter(self.directory)
+            try:
+                self._request_writer = AsyncLogWriter(
+                    self.directory, kinds=("requests",)
+                )
+            except BaseException:
+                self._writer.close()
+                raise
         self.summary["logging"] = (
             self._writer.stats
             if self._writer is not None
             else {"enabled": False, "mode": "disabled", "incomplete": False}
         )
+        self.summary["request_logging"] = (
+            self._request_writer.stats
+            if self._request_writer is not None
+            else {"enabled": False, "mode": "disabled", "incomplete": False}
+        )
 
     def _publish(self, kind, value):
-        if self._writer is not None:
+        writer, lock = (
+            (self._request_writer, self._request_publish_lock)
+            if kind == "requests"
+            else (self._writer, self._publish_lock)
+        )
+        if writer is not None:
             # Queue transport is asynchronous: never lend mutable predictions,
             # receipts or executor reports to its feeder thread.
-            value = copy.deepcopy(value)
-            with self._publish_lock:
-                self._writer.submit(kind, value)
+            # Each channel has its own lock and queue. Contention within one
+            # channel drops evidence without delaying another thread's work.
+            if not lock.acquire(blocking=False):
+                writer.stats["dropped"][kind] += 1
+                writer.stats["incomplete"] = True
+                return False
+            try:
+                value = copy.deepcopy(value)
+                return writer.submit(kind, value)
+            except Exception as exc:
+                writer.stats["incomplete"] = True
+                writer.stats["errors"].append(f"producer: {type(exc).__name__}: {exc}")
+                writer.stats["dropped"][kind] += 1
+                return False
+            finally:
+                lock.release()
+
+    def request(self, payload):
+        """Small owned numeric snapshots only; camera pixels stay out of IPC."""
+        if self.enabled:
+            return self._publish("requests", payload)
 
     def event(self, name, **fields):
         if self.enabled:
@@ -382,27 +457,47 @@ class SessionLog:
 
     def check(self):
         """Poll/report logger failures only between chunks or while paused."""
-        if self._writer is None:
-            return
-        self._writer.poll()
-        stats = self._writer.stats
-        reason = "error" if stats["errors"] else "dropped"
-        if stats["incomplete"] and reason not in self._warnings:
-            self._warnings.add(reason)
-            detail = stats["errors"][-1] if stats["errors"] else "后台日志队列已满"
-            print(
-                f"[推理] 日志不完整：{detail}；详情见结束摘要。动作循环不等待日志写入。",
-                file=sys.stderr,
-                flush=True,
-            )
+        if self.recorder is not None:
+            self.recorder.poll()
+            stats = self.recorder.stats
+            if stats.get("incomplete") and "recording" not in self._warnings:
+                self._warnings.add("recording")
+                print(
+                    "[推理] 图像/反馈记录不完整，控制继续；详情见 recording 摘要。",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        for label, writer in (
+            ("控制", self._writer),
+            ("请求", self._request_writer),
+        ):
+            if writer is None:
+                continue
+            writer.poll()
+            stats = writer.stats
+            reason = (label, "error" if stats["errors"] else "dropped")
+            if stats["incomplete"] and reason not in self._warnings:
+                self._warnings.add(reason)
+                detail = stats["errors"][-1] if stats["errors"] else "后台日志队列已满"
+                print(
+                    f"[推理] {label}日志不完整：{detail}；详情见结束摘要。动作循环不等待日志写入。",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def close(self):
         if self._closed:
             return
         self._closed = True
-        if self._writer is not None:
-            self._writer.close()
-            self.check()
+        for writer in (self._writer, self._request_writer):
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception as exc:
+                    # Still release the other child if one cleanup fails.
+                    writer.stats["incomplete"] = True
+                    writer.stats["errors"].append(f"close: {type(exc).__name__}: {exc}")
+        self.check()
         self.summary["ended_walltime"] = time.time()
         count = self.summary["prediction_count"]
         self.summary["mean_inference_elapsed_s"] = (
@@ -422,7 +517,21 @@ class LoggedSink:
         health_started = self.monotonic()
         self.provider.check_health()
         started = self.monotonic()
-        receipt = self.sink.send_action(row, deadline)
+        try:
+            receipt = self.sink.send_action(row, deadline)
+        except Exception as exc:
+            # A partial SDK submission must not silently disappear from the
+            # timeline merely because both-arm acknowledgement failed.
+            self.log.event(
+                "command_failed",
+                action_base=row,
+                deadline_walltime=deadline,
+                submit_monotonic=started,
+                returned_monotonic=self.monotonic(),
+                error={"type": type(exc).__name__, "message": str(exc)},
+                receipt_status="unconfirmed; may include partial SDK submission",
+            )
+            raise
         finished = self.monotonic()
         self.log.command(
             row,
@@ -629,6 +738,8 @@ def _sha256(path):
 def load_policy_contract(args, log):
     from egomimic.robot.piper_pico.live_policy_contract import prepare_live_contract
 
+    validate_recording_args(args)
+
     if args.home_on_start and not args.execute:
         raise ValueError("--home-on-start true 需要 --execute；只观察模式不会回 home。")
     backend = getattr(args, "policy_backend", "hpt")
@@ -789,6 +900,30 @@ def _finish_policy_contract(args, log, contract, policy, source):
         "gripper_open_m": open_m,
         "gripper_commands": "clip to [0, open_m]; raw predictions retained when logging enabled; pose unchanged",
         "checkpoint_geometry_bound": source["policy_backend"] == "pi05",
+        "recording_contract": {
+            "schema": "piper_policy_recording_v1",
+            "images": getattr(args, "record_images", "off"),
+            "continuous_image_format": getattr(args, "record_video_format", "mp4"),
+            "continuous_feedback": bool(getattr(args, "record_feedback", False)),
+            "request_images": "exact selected pre-adapter HWC RGB uint8; lossless PNG; replay with runtime_metadata preprocessing",
+            "image_identity": "per-camera 0-based publication frame_id; unique within this process/session",
+            "feedback_identity": "per-arm 0-based publication feedback_id; not a CAN-source update counter",
+            "feedback_ee_pose": "arm base; xyz metres, extrinsic xyz Euler radians",
+            "request_base_state": "left xyz/rotation-vector radians/gripper metres, then right; histories same layout",
+            "timestamps": "source and receive stamps are host Unix seconds; scheduling additionally records host monotonic seconds",
+            "sdk_receipts": "host SDK call returned, not physical arrival or firmware acknowledgement",
+            "pipeline_sha256": {
+                name: _sha256(Path(__file__).with_name(name))
+                for name in (
+                    "image_geometry.py",
+                    "policy_inference.py",
+                    "pi05_remote.py",
+                    "state_history.py",
+                    "policy_audit.py",
+                    "policy_recording.py",
+                )
+            },
+        },
         "execute": args.execute,
         "home_on_start": args.home_on_start,
     }
@@ -852,7 +987,6 @@ def run_session(args, log):
 
 def _run_device_session(args, log, contract, policy, limits):
     history_offsets = tuple(getattr(policy, "state_history_offsets_s", ()))
-    policy = ActuatorPolicy(policy, policy.adapter.gripper_open_m, log)
     import multiprocessing as mp
     from multiprocessing.managers import SharedMemoryManager
 
@@ -883,6 +1017,51 @@ def _run_device_session(args, log, contract, policy, limits):
         )
         stack.callback(env.stop)
         env.start()
+        recorder = None
+        if validate_recording_args(args):
+            from egomimic.robot.piper_pico.policy_recording import PolicyRecorder
+
+            recorder = PolicyRecorder(
+                log.directory / "recording",
+                {camera.name: camera.ring for camera in env.cameras},
+                {arm.name: arm.ring for arm in env.arms},
+                image_mode=args.record_images,
+                video_format=args.record_video_format,
+                record_feedback=args.record_feedback,
+                queue_capacity=args.record_queue_capacity,
+                cache_frames=args.record_cache_frames,
+                segment_seconds=args.record_segment_seconds,
+            )
+
+            # Register cleanup before startup: even partial startup must release
+            # children before the source SHM manager is torn down.
+            def close_recorder():
+                try:
+                    recorder.close()
+                except Exception as exc:
+                    log.summary.setdefault("recording_cleanup_errors", []).append(
+                        {"type": type(exc).__name__, "message": str(exc)}
+                    )
+                finally:
+                    log.summary["recording"] = recorder.stats
+                    log.recorder = None
+
+            stack.callback(close_recorder)
+            recorder.start()
+            log.recorder = recorder
+            log.summary["recording"] = recorder.stats
+            print(
+                f"[推理] 后台记录：图像={args.record_images}，连续反馈={args.record_feedback}；{log.directory / 'recording'}",
+                flush=True,
+            )
+        if getattr(log, "enabled", False):
+            from egomimic.robot.piper_pico.policy_audit import RecordedPolicy
+
+            audit_policy = RecordedPolicy(policy, log, recorder)
+            policy = audit_policy
+        else:
+            audit_policy = None
+        policy = ActuatorPolicy(policy, policy.adapter.gripper_open_m, log)
         provider = LiveObservationProvider(
             env, max_source_age_s=args.max_observation_age
         )
@@ -915,7 +1094,13 @@ def _run_device_session(args, log, contract, policy, limits):
                             ) from None
                         time.sleep(0.01)
             print("[推理] 模型预热中，本次预测不执行。", flush=True)
-            prediction = policy.predict(provider.latest())
+            if audit_policy is not None:
+                audit_policy.phase = "warmup"
+            try:
+                prediction = policy.predict(provider.latest())
+            finally:
+                if audit_policy is not None:
+                    audit_policy.phase = "policy"
             log.event("warmup", inference_elapsed_s=prediction["inference_elapsed_s"])
             if keys.poll() == "stop":
                 return "stopped"
@@ -991,6 +1176,10 @@ def _run_device_session(args, log, contract, policy, limits):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    try:
+        validate_recording_args(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     if args.policy_backend == "pi05" and args.offline_eval:
         raise SystemExit("--offline-eval 只支持本地 HPT；Pi0.5 请使用独立评估流程。")
     if args.device is None:

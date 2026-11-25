@@ -2,6 +2,8 @@
 
 import json
 import os
+import signal
+import threading
 import time
 from types import SimpleNamespace
 
@@ -16,6 +18,18 @@ from egomimic.robot.piper_pico.policy_execution import (
     execute_action_block,
 )
 from egomimic.robot.piper_pico.policy_logging import AsyncLogWriter
+
+
+@pytest.mark.parametrize("kinds", [("commands", "cycles", "events"), ("requests",)])
+def test_background_log_ignores_terminal_interrupt_until_parent_drains(tmp_path, kinds):
+    writer = AsyncLogWriter(tmp_path, kinds=kinds)
+    try:
+        os.kill(writer._process.pid, signal.SIGINT)
+        assert writer.submit(kinds[0], {"sample": 7})
+    finally:
+        writer.close()
+    assert writer.stats["drained"] and not writer.stats["incomplete"]
+    assert writer.stats["written"][kinds[0]] == 1
 
 
 def _never_consume(directory, records, status):
@@ -66,6 +80,7 @@ def test_disabled_has_no_worker_no_stream_serialization_and_keeps_summary(
     summary = json.loads((log.directory / "summary.json").read_text())
     assert summary["action_count"] == summary["prediction_count"] == 1
     assert summary["logging"]["enabled"] is False
+    assert summary["request_logging"]["enabled"] is False
     assert (log.directory / "arguments.json").exists()
     assert (log.directory / "manifest.json").exists()
 
@@ -74,6 +89,7 @@ def test_worker_encodes_and_drains_all_kinds(tmp_path, monkeypatch):
     log = live.SessionLog(tmp_path / "on", SimpleNamespace(execute=True, log=True))
     pid = log.summary["logging"]["writer_pid"]
     assert pid != os.getpid()
+    assert log.summary["request_logging"]["writer_pid"] not in (pid, os.getpid())
     try:
         with monkeypatch.context() as patch:
 
@@ -108,11 +124,13 @@ def test_worker_encodes_and_drains_all_kinds(tmp_path, monkeypatch):
     )
     assert stats["drained"] and not stats["incomplete"]
     assert stats["writer_exitcode"] == 0
+    assert log.summary["request_logging"]["written"] == {"requests": 0}
+    assert log.summary["request_logging"]["drained"]
 
 
 def test_queued_snapshots_do_not_change_with_callers(tmp_path, monkeypatch):
     class Capture:
-        def __init__(self, directory):
+        def __init__(self, directory, **kwargs):
             self.stats = {}
             self.rows = []
 
@@ -132,14 +150,37 @@ def test_queued_snapshots_do_not_change_with_callers(tmp_path, monkeypatch):
     log.command(row, 2, 1, 1.01, receipt)
     log.cycle(report)
     log.event("test", widths=row)
+    request = {
+        "base_state": row,
+        "base_state_history": np.zeros((2, 14)),
+        "rtc": {"prefix": np.ones((100, 14)), "weights": np.ones(100)},
+        "prediction": {"actions": np.full((100, 14), 2.0)},
+    }
+    log.request(request)
     row[:] = 8
     receipt["receipts"][0]["command_id"] = 99
     report["execution"]["samples"].append(2)
+    request["base_state_history"][:] = 9
+    request["rtc"]["prefix"][:] = 9
+    request["rtc"]["weights"][:] = 9
+    request["prediction"]["actions"][:] = 9
     saved = dict(log._writer.rows)
     assert saved["commands"]["action_base"].tolist() == [0] * 14
     assert saved["commands"]["device_receipt"]["receipts"][0]["command_id"] == 1
     assert saved["cycles"]["execution"]["samples"] == [1]
     assert saved["events"]["widths"].tolist() == [0] * 14
+    assert set(saved) == {"commands", "cycles", "events"}
+    [(kind, saved_request)] = log._request_writer.rows
+    assert kind == "requests"
+    np.testing.assert_array_equal(saved_request["base_state"], np.zeros(14))
+    np.testing.assert_array_equal(
+        saved_request["base_state_history"], np.zeros((2, 14))
+    )
+    np.testing.assert_array_equal(saved_request["rtc"]["prefix"], np.ones((100, 14)))
+    np.testing.assert_array_equal(saved_request["rtc"]["weights"], np.ones(100))
+    np.testing.assert_array_equal(
+        saved_request["prediction"]["actions"], np.full((100, 14), 2.0)
+    )
 
 
 def test_full_queue_drops_new_records_without_waiting_and_close_is_bounded(tmp_path):
@@ -201,8 +242,12 @@ def test_stalled_writer_does_not_stall_real_clock_action_block(tmp_path, monkeyp
     monkeypatch.setattr(
         live,
         "AsyncLogWriter",
-        lambda directory: AsyncLogWriter(
-            directory, capacity=1, close_timeout=0.1, _worker_target=_never_consume
+        lambda directory, **kwargs: AsyncLogWriter(
+            directory,
+            capacity=1,
+            close_timeout=0.1,
+            _worker_target=_never_consume,
+            **kwargs,
         ),
     )
     log = live.SessionLog(tmp_path / "stalled", SimpleNamespace(execute=False))
@@ -256,4 +301,122 @@ def test_worker_failure_warns_once_and_preserves_actions_hold_and_summary(
     summary = json.loads((log.directory / "summary.json").read_text())
     assert summary["action_count"] == 1
     assert summary["logging"]["incomplete"]
-    assert summary["logging"]["dropped"] == {"commands": 1, "cycles": 0, "events": 2}
+    assert summary["logging"]["dropped"] == {
+        "commands": 1,
+        "cycles": 0,
+        "events": 2,
+    }
+
+
+def test_writer_only_creates_and_accepts_its_owned_streams(tmp_path):
+    writer = AsyncLogWriter(tmp_path, kinds=("requests",))
+    try:
+        with pytest.raises(ValueError, match="not owned"):
+            writer.submit("commands", {"index": 0})
+        assert writer.submit("requests", {"request_id": 3, "state": np.arange(14)})
+    finally:
+        writer.close()
+    assert {path.name for path in tmp_path.glob("*.jsonl")} == {"requests.jsonl"}
+    assert writer.stats["written"] == {"requests": 1}
+    assert writer.stats["unwritten"] == {"requests": 0}
+    assert _records(tmp_path / "requests.jsonl")[0]["state"] == list(range(14))
+
+
+def test_request_snapshot_copy_and_lock_do_not_drop_control_records(
+    tmp_path, monkeypatch
+):
+    log = live.SessionLog(tmp_path / "isolation", SimpleNamespace(execute=False))
+    entered, release = threading.Event(), threading.Event()
+    payload = {"request_id": 1, "prediction": {"actions": np.ones((100, 14))}}
+    deepcopy = live.copy.deepcopy
+
+    def delayed_copy(value, *args, **kwargs):
+        if value is payload:
+            entered.set()
+            assert release.wait(3)
+        return deepcopy(value, *args, **kwargs)
+
+    monkeypatch.setattr(live.copy, "deepcopy", delayed_copy)
+    worker = threading.Thread(target=log.request, args=(payload,))
+    try:
+        worker.start()
+        assert entered.wait(2)
+        assert log._request_publish_lock.locked()
+        before = time.monotonic()
+        log.command(np.zeros(14), 1, 0, 0.001)
+        log.event("during_request_copy")
+        log.cycle({"observation_timestamp": 1})
+        assert time.monotonic() - before < 0.5
+        assert log._writer.stats["submitted"] == {
+            "commands": 1,
+            "events": 1,
+            "cycles": 1,
+        }
+        # A second request may drop, but cannot occupy/control the other lock.
+        assert log.request({"request_id": 2}) is False
+        assert log._request_writer.stats["dropped"] == {"requests": 1}
+        assert not log._writer.stats["incomplete"]
+    finally:
+        release.set()
+        worker.join(3)
+        log.close()
+    assert not worker.is_alive()
+    assert log.summary["logging"]["drained"]
+    assert not log.summary["logging"]["incomplete"]
+    assert log.summary["request_logging"]["written"] == {"requests": 1}
+    assert (
+        _records(log.directory / "requests.jsonl")[0]["prediction"]["actions"]
+        == [[1.0] * 14] * 100
+    )
+
+
+def test_stalled_request_queue_cannot_consume_control_queue_slots(
+    tmp_path, monkeypatch
+):
+    def factory(directory, **kwargs):
+        if kwargs.get("kinds") == ("requests",):
+            return AsyncLogWriter(
+                directory,
+                capacity=2,
+                close_timeout=0.1,
+                _worker_target=_never_consume,
+                **kwargs,
+            )
+        return AsyncLogWriter(directory, **kwargs)
+
+    monkeypatch.setattr(live, "AsyncLogWriter", factory)
+    log = live.SessionLog(tmp_path / "request_stall", SimpleNamespace(execute=False))
+    try:
+        before = time.monotonic()
+        accepted = [log.request({"request_id": i}) for i in range(100)]
+        for i in range(100):
+            log.command(np.full(14, i), 2, i / 30, i / 30 + 0.001)
+        assert time.monotonic() - before < 1
+        assert sum(accepted) == 2
+    finally:
+        log.close()
+    assert log.summary["logging"]["written"]["commands"] == 100
+    assert not log.summary["logging"]["incomplete"]
+    assert log.summary["request_logging"]["dropped"]["requests"] == 98
+    assert log.summary["request_logging"]["unwritten"]["requests"] == 2
+    assert log.summary["request_logging"]["incomplete"]
+
+
+def test_request_startup_failure_closes_already_started_control_writer(
+    tmp_path, monkeypatch
+):
+    created = []
+
+    def factory(directory, **kwargs):
+        if kwargs.get("kinds") == ("requests",):
+            raise RuntimeError("request worker failed to start")
+        writer = AsyncLogWriter(directory, **kwargs)
+        created.append(writer)
+        return writer
+
+    monkeypatch.setattr(live, "AsyncLogWriter", factory)
+    with pytest.raises(RuntimeError, match="failed to start"):
+        live.SessionLog(tmp_path / "partial", SimpleNamespace(execute=False))
+    assert len(created) == 1
+    assert created[0]._closed and created[0].stats["drained"]
+    assert created[0].stats["writer_exitcode"] == 0

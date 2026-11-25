@@ -13,7 +13,12 @@ def analytic_checks():
     import jax
     import jax.numpy as jnp
     import numpy as np
-    from egoverse_pi05.rtc import guidance_scale, guided_velocity, padded_mask
+    from egoverse_pi05.rtc import (
+        guidance_scale,
+        guided_velocity,
+        identity_guided_velocity,
+        padded_mask,
+    )
 
     x = jnp.array([0.4, -0.2])
     a = jnp.array([[0.2, 0.4], [-0.3, 0.1]])
@@ -36,8 +41,22 @@ def analytic_checks():
     np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
     # Non-diagonal Jacobian affects even an output coordinate with error-mask0.
     assert abs(float(got[1] - velocity(x, t)[1])) > 0.01
+    # Identity removes only the denoised Jacobian, retaining the sign, time
+    # multiplier and single mask factor. Unlike full VJP, an error-masked-out
+    # coordinate receives no correction through a cross-coordinate Jacobian.
+    expected_identity = velocity(x, t) - guidance_scale(t, 5.0) * mask * (
+        target - clean
+    )
+    identity = jax.jit(identity_guided_velocity, static_argnums=(0,))(
+        velocity, x, t, target, mask, 5.0
+    )
+    np.testing.assert_allclose(identity, expected_identity, rtol=1e-6, atol=1e-6)
+    np.testing.assert_array_equal(identity[1], velocity(x, t)[1])
+    assert float(jnp.linalg.norm(identity - got)) > 0.01
     zero = guided_velocity(velocity, x, t, target, jnp.zeros(2), 5.0)
     np.testing.assert_array_equal(zero, velocity(x, t))
+    identity_zero = identity_guided_velocity(velocity, x, t, target, jnp.zeros(2), 5.0)
+    np.testing.assert_array_equal(identity_zero, velocity(x, t))
     np.testing.assert_array_equal(
         np.asarray([guidance_scale(0.0, 5.0), guidance_scale(1.0, 5.0)]), [5.0, 5.0]
     )
@@ -47,9 +66,13 @@ def analytic_checks():
 
     moved = x - 0.1 * guided_velocity(no_flow, x, 0.7, target, jnp.ones(2), 5.0)
     assert float(jnp.linalg.norm(moved - target)) < float(jnp.linalg.norm(x - target))
+    identity_moved = x - 0.1 * identity_guided_velocity(
+        no_flow, x, 0.7, target, jnp.ones(2), 5.0
+    )
+    np.testing.assert_array_equal(identity_moved, moved)
     assert not np.any(padded_mask(np.ones(100))[:, 14:])
     print(
-        "RTC ANALYTIC CHECKS PASSED: reverse-time sign, affine VJP, single soft weight, zero mask, padded dimensions",
+        "RTC ANALYTIC CHECKS PASSED: reverse-time sign, affine VJP versus identity, single soft weight, zero mask, padded dimensions",
         flush=True,
     )
 

@@ -162,6 +162,7 @@ def run_streaming_loop(
         report = {
             "status": "completed",
             "timing_mode": "streaming",
+            "audit_request_id": prediction.get("audit_request_id"),
             "observation_timestamp": float(frame.timestamp),
             "measured_base_state": np.asarray(frame.base_state).tolist(),
             "source_timestamps": stamps,
@@ -286,9 +287,7 @@ def run_streaming_loop(
                 prediction = ready.future.result()
                 elapsed = monotonic() - ready.requested_monotonic
                 actions = checked_prediction(frame, prediction)
-                candidate = ChunkPlan(
-                    actions, policy.timing, frame.timestamp + delay
-                )
+                candidate = ChunkPlan(actions, policy.timing, frame.timestamp + delay)
                 offset = candidate.offset(now_wall)
                 fresh = now_wall - frame.timestamp <= limits.max_observation_age_s
                 if fresh and offset + blend_s < candidate.span:
